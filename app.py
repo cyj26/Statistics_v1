@@ -105,7 +105,7 @@ def calc_mi_approx(model, obs_df, obs_vars):
 def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=50):
     """
     초기 CFA → MI 계산 → 같은 요인 내 잔차공분산 반복 추가 → 수정모형
-    적합도 기준: NFI·RFI·IFI·TLI·CFI ≥ .90, RMSEA < .08
+    적합도 기준: NFI·RFI·IFI·TLI·CFI ≥ .90, RMSEA < .049
     MI 기준: MI > 3.84 (χ² 임계값, p<.05)
     Returns (result_dict, error_str)
     """
@@ -170,7 +170,7 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=50):
                     fit.get("IFI",  0) >= 0.90 and
                     fit.get("TLI",  0) >= 0.90 and
                     fit.get("CFI",  0) >= 0.90 and
-                    fit.get("RMSEA", 1) <  0.08)
+                    fit.get("RMSEA", 1) <  0.049)
 
         def _inspect(m):
             ins     = m.inspect(std_est=True)
@@ -307,32 +307,35 @@ def run_cfa_sem(df, constructs, hypotheses=None):
         except Exception:
             stats_dict = {}
 
-        key_variants = {
-            "DoF":   ["DoF", "dof", "df", "DF"],
-            "chi2":  ["chi2", "Chi2", "chi_2", "chi-square"],
-            "pval":  ["chi2 p-value", "pval", "p-value", "p_value", "Pval", "P"],
-            "CFI":   ["CFI", "cfi"],
-            "TLI":   ["TLI", "tli", "NNFI", "nnfi"],
-            "RMSEA": ["RMSEA", "rmsea"],
-            "SRMR":  ["SRMR", "srmr"],
-        }
-        fit = {}
-        for label, variants in key_variants.items():
-            for v in variants:
-                if v in stats_dict:
-                    try:
-                        fit[label] = round(float(stats_dict[v]), 3)
-                    except Exception:
-                        fit[label] = "-"
-                    break
-
-        # 매칭된 것이 하나도 없으면 가진 것 다 표시
-        if not fit:
-            for k, val in stats_dict.items():
-                try:
-                    fit[str(k)] = round(float(val), 3)
-                except Exception:
-                    fit[str(k)] = str(val)
+        # χ², df, χ²/df, p, NFI, RFI, IFI, TLI, CFI, RMSEA 계산
+        try:
+            chi2    = float(stats_dict.get("chi2", 0))
+            dof     = float(stats_dict.get("DoF", 1))
+            chi2_bl = float(stats_dict.get("chi2 Baseline", 0))
+            dof_bl  = float(stats_dict.get("DoF Baseline", 1))
+            pval    = float(stats_dict.get("chi2 p-value", 1))
+            cfi     = float(stats_dict.get("CFI", 0))
+            tli     = float(stats_dict.get("TLI", 0))
+            nfi     = float(stats_dict.get("NFI", 0))
+            rmsea   = float(stats_dict.get("RMSEA", 1))
+            rfi = ((chi2_bl / dof_bl - chi2 / dof) / (chi2_bl / dof_bl)
+                   if chi2_bl > 0 and dof_bl > 0 and dof > 0 else 0.0)
+            ifi = ((chi2_bl - chi2) / (chi2_bl - dof)
+                   if (chi2_bl - dof) > 0 else 0.0)
+            fit = {
+                "χ²":    round(chi2, 3),
+                "df":    int(dof),
+                "χ²/df": round(chi2 / dof, 3) if dof > 0 else "-",
+                "p":     round(pval, 3),
+                "NFI":   round(nfi, 3),
+                "RFI":   round(rfi, 3),
+                "IFI":   round(ifi, 3),
+                "TLI":   round(tli, 3),
+                "CFI":   round(cfi, 3),
+                "RMSEA": round(rmsea, 3),
+            }
+        except Exception:
+            fit = {}
 
         return ins, std_col, stats_dict, fit
 
@@ -362,7 +365,7 @@ def _extract_load_df(ins, std_col, constructs):
 
     rename_map  = {lv_col: rename_lv, ind_col: rename_ind,
                    "Estimate": "비표준화β", std_col: "표준화β",
-                   "Std. Err": "SE", "z-value": "z값", "p-value": "p값_raw"}
+                   "Std. Err": "SE", "z-value": "C.R.", "p-value": "p값_raw"}
     load_df     = load_df.rename(columns=rename_map)
 
     if "p값_raw" in load_df.columns:
@@ -370,7 +373,7 @@ def _extract_load_df(ins, std_col, constructs):
             lambda p: fmt_p(p) if str(p).strip() not in ("-", "") else "-")
         load_df         = load_df.drop(columns=["p값_raw"])
 
-    for col in [c for c in ["비표준화β","표준화β","SE","z값"] if c in load_df.columns]:
+    for col in [c for c in ["비표준화β","표준화β","SE","C.R."] if c in load_df.columns]:
         load_df[col] = pd.to_numeric(load_df[col], errors="coerce").round(3)
 
     return load_df.reset_index(drop=True), lv_col
@@ -429,7 +432,7 @@ def build_sem_table(df, constructs, hypotheses):
 
         rename_map = {"lval":"종속변수","rval":"독립변수",
                       "Estimate":"비표준화β", std_col:"표준화β",
-                      "Std. Err":"SE","z-value":"z값","p-value":"p값_raw"}
+                      "Std. Err":"SE","z-value":"C.R.","p-value":"p값_raw"}
         path_df = path_df.rename(columns=rename_map)
 
         hyp_map = {(s, t): f"H{i+1}" for i, (s, t) in enumerate(hypotheses)}
@@ -449,11 +452,11 @@ def build_sem_table(df, constructs, hypotheses):
         path_df["p값"]     = path_df["p값_raw"].apply(
             lambda p: fmt_p(_safe_p(p)) if not np.isnan(_safe_p(p)) else "-")
 
-        num_cols = [c for c in ["비표준화β","표준화β","SE","z값"] if c in path_df.columns]
+        num_cols = [c for c in ["비표준화β","표준화β","SE","C.R."] if c in path_df.columns]
         for col in num_cols:
             path_df[col] = pd.to_numeric(path_df[col], errors="coerce").round(3)
 
-        out_cols = ["가설","경로","표준화β","SE","z값","p값","유의성","채택여부"]
+        out_cols = ["가설","경로","표준화β","SE","C.R.","p값","유의성","채택여부"]
         out_cols = [c for c in out_cols if c in path_df.columns]
         return path_df[out_cols], fit
 
@@ -1060,7 +1063,7 @@ if not tab_labels:
     st.warning("실행된 분석이 없습니다. 분석 방법을 선택하고 설정을 완료한 후 다시 시도하세요.")
     st.stop()
 
-FIT_NOTE = "권장 기준: NFI·RFI·IFI·TLI·CFI ≥ .90 | RMSEA < .08 | SRMR ≤ .08"
+FIT_NOTE = "권장 기준: NFI·RFI·IFI·TLI·CFI ≥ .90 | RMSEA < .049 | SRMR ≤ .08"
 tabs = st.tabs(tab_labels)
 
 for tab, lbl in zip(tabs, tab_labels):
@@ -1089,7 +1092,7 @@ for tab, lbl in zip(tabs, tab_labels):
                 {"지수": "IFI",   "권장기준": "≥ .90"},
                 {"지수": "TLI",   "권장기준": "≥ .90"},
                 {"지수": "CFI",   "권장기준": "≥ .90"},
-                {"지수": "RMSEA", "권장기준": "< .08"},
+                {"지수": "RMSEA", "권장기준": "< .049"},
                 {"지수": "SRMR",  "권장기준": "≤ .08"},
             ])
             with st.expander("📌 적합도 권장 기준"):
@@ -1125,11 +1128,11 @@ for tab, lbl in zip(tabs, tab_labels):
                         fv = float(v)
                         if col in checks and fv < checks[col]:
                             colors[idx] = "background-color:#FFE0E0"
-                        elif col == "RMSEA" and fv >= 0.08:
+                        elif col == "RMSEA" and fv >= 0.049:
                             colors[idx] = "background-color:#FFE0E0"
                         elif col in checks and fv >= checks[col]:
                             colors[idx] = "background-color:#E8F5E9"
-                        elif col == "RMSEA" and fv < 0.08:
+                        elif col == "RMSEA" and fv < 0.049:
                             colors[idx] = "background-color:#E8F5E9"
                     except Exception:
                         pass
@@ -1137,7 +1140,7 @@ for tab, lbl in zip(tabs, tab_labels):
 
             st.dataframe(fit_cmp.style.apply(_hl_fit, axis=1),
                          use_container_width=True)
-            st.caption("🟢 기준 충족 | 🔴 기준 미충족 | RMSEA < .08 권장")
+            st.caption("🟢 기준 충족 | 🔴 기준 미충족 | RMSEA < .049 권장")
 
             # ── 수정 내역 ─────────────────────────────────────────────────────
             if was_mod and extra_cov:
@@ -1151,7 +1154,7 @@ for tab, lbl in zip(tabs, tab_labels):
             elif not was_mod:
                 all_ok = (fit_init.get("NFI",0)>=.90 and fit_init.get("RFI",0)>=.90 and
                           fit_init.get("IFI",0)>=.90 and fit_init.get("TLI",0)>=.90 and
-                          fit_init.get("CFI",0)>=.90 and fit_init.get("RMSEA",1)<.08)
+                          fit_init.get("CFI",0)>=.90 and fit_init.get("RMSEA",1)<.049)
                 if all_ok:
                     st.success("✅ 초기 모형 적합도 양호 — 수정 불필요")
                 else:
@@ -1179,14 +1182,41 @@ for tab, lbl in zip(tabs, tab_labels):
 
         elif lbl == "SEM":
             paths, fit = c
+
+            # ── 가설 검증 결과 ────────────────────────────────────────────────
             def hl(row):
                 color = "#E8F5E9" if row.get("채택여부") == "채택" else "#FFF3F3"
                 return [f"background-color:{color}"] * len(row)
             st.dataframe(paths.style.apply(hl, axis=1), use_container_width=True)
             n_adopt = (paths["채택여부"] == "채택").sum()
             st.markdown(f"**채택: {n_adopt}개 / 기각: {len(paths)-n_adopt}개 / 전체: {len(paths)}개**")
+
+            # ── 모델 적합도 (색상 강조) ───────────────────────────────────────
             st.markdown("**모델 적합도**")
-            st.dataframe(pd.DataFrame([fit]), use_container_width=True)
+            fit_col_order = ["χ²","df","χ²/df","p","NFI","RFI","IFI","TLI","CFI","RMSEA"]
+            fit_row = {k: fit.get(k, "-") for k in fit_col_order}
+            fit_df  = pd.DataFrame([fit_row])
+
+            def _hl_sem(row):
+                checks = {"NFI":.90,"RFI":.90,"IFI":.90,"TLI":.90,"CFI":.90}
+                colors = []
+                for col in row.index:
+                    v = row[col]
+                    try:
+                        fv = float(v)
+                        if col in checks:
+                            colors.append("background-color:#E8F5E9" if fv >= checks[col]
+                                          else "background-color:#FFE0E0")
+                        elif col == "RMSEA":
+                            colors.append("background-color:#E8F5E9" if fv < 0.049
+                                          else "background-color:#FFE0E0")
+                        else:
+                            colors.append("")
+                    except Exception:
+                        colors.append("")
+                return colors
+
+            st.dataframe(fit_df.style.apply(_hl_sem, axis=1), use_container_width=True)
             st.caption(FIT_NOTE)
 
         elif lbl == "회귀분석":
