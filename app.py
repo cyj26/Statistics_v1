@@ -125,17 +125,26 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=50):
         item_to_lv = {item: lv for lv, items in constructs.items() for item in items}
         all_items  = [i for items in constructs.values() for i in items]
         data       = df[all_items].dropna()
-        # 요인분산=1 고정 방식 → 모든 문항의 SE·t값·p값 산출 가능
-        meas_lines = [f"  {lv} =~ {' + '.join(items)}"
-                      for lv, items in constructs.items()]
-        var_lines  = [f"  {lv} ~~ 1*{lv}" for lv in constructs.keys()]
-        base_str   = "\n".join(meas_lines) + "\n" + "\n".join(var_lines)
+
+        meas_lines    = [f"  {lv} =~ {' + '.join(items)}"
+                         for lv, items in constructs.items()]
+        meas_only_str = "\n".join(meas_lines)
+        # 요인분산=1 고정 → 모든 문항 SE·t·p 산출
+        var_lines  = [f"  {lv} ~~ 1 * {lv}" for lv in constructs.keys()]
+        base_str_v1 = meas_only_str + "\n" + "\n".join(var_lines)
 
         def _fit(model_str):
             try:
                 m = Model(model_str); m.fit(data); return m
             except Exception:
                 return None
+
+        # 요인분산 고정 방식 먼저 시도, 실패 시 참조지표 방식 폴백
+        _test = _fit(base_str_v1)
+        if _test is not None:
+            base_str = base_str_v1
+        else:
+            base_str = meas_only_str   # 참조지표(기본) 방식
 
         def _extract_fit(m):
             """χ², df, χ²/df, p, NFI, RFI, IFI, TLI, CFI, RMSEA 계산"""
@@ -445,12 +454,13 @@ def build_sem_table(df, constructs, hypotheses,
         lv_names   = set(constructs.keys())
         data       = df[all_items].dropna()
 
-        # ── 측정모형 (요인분산=1 고정) + CFA 확정 공분산 + 구조경로 ─────────
-        meas_lines = [f"  {lv} =~ {' + '.join(items)}"
-                      for lv, items in constructs.items()]
-        var_lines  = [f"  {lv} ~~ 1*{lv}" for lv in constructs.keys()]
-        meas_str   = "\n".join(meas_lines) + "\n" + "\n".join(var_lines)
-        # CFA에서 확정된 잔차공분산 이어받기 (Anderson & Gerbing 2단계)
+        # ── 측정모형 + CFA 확정 공분산 + 구조경로 ───────────────────────────
+        meas_lines    = [f"  {lv} =~ {' + '.join(items)}"
+                         for lv, items in constructs.items()]
+        var_lines     = [f"  {lv} ~~ 1 * {lv}" for lv in constructs.keys()]
+        meas_only_str = "\n".join(meas_lines)
+        meas_var_str  = meas_only_str + "\n" + "\n".join(var_lines)
+
         cfa_cov  = cfa_extra_cov or []
         cov_str  = ("\n" + "\n".join(f"  {a} ~~ {b}" for a, b in cfa_cov)
                     if cfa_cov else "")
@@ -459,13 +469,19 @@ def build_sem_table(df, constructs, hypotheses,
             deps[t].append(s)
         struct_str = "\n".join(f"  {t} ~ {' + '.join(ss)}"
                                for t, ss in deps.items())
-        base_str = meas_str + cov_str + "\n" + struct_str
 
+        # 요인분산=1 먼저 시도, 실패 시 참조지표 방식 폴백
         def _fit_model(model_str):
             try:
                 m = Model(model_str); m.fit(data); return m
             except Exception:
                 return None
+
+        _test_base = _fit_model(meas_var_str + cov_str + "\n" + struct_str)
+        if _test_base is not None:
+            base_str = meas_var_str + cov_str + "\n" + struct_str
+        else:
+            base_str = meas_only_str + cov_str + "\n" + struct_str
 
         def _extract_fit(m):
             try:
