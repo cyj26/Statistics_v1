@@ -8,7 +8,7 @@ import numpy as np
 import re
 from collections import defaultdict
 
-st.set_page_config(page_title="📊 통계 자동 분석기",
+st.set_page_config(page_title="통계 자동 분석기",
                    page_icon="📊", layout="wide")
 
 # ── 비밀번호 잠금 ─────────────────────────────────────────────────────────────
@@ -588,13 +588,16 @@ def build_sem_table(df, constructs, hypotheses,
 
         path_final = _extract_paths(m_cur)
         was_mod    = len(mod_log) > 0
+        init_mi_sem  = calc_mi_approx(m0,   data, all_items)   # 초기 SEM MI
+        final_mi_sem = calc_mi_approx(m_cur, data, all_items)  # 최종 SEM MI
 
         return (path_final, fit0, fit_cur,
-                pd.DataFrame(mod_log), extra_cov, was_mod)
+                pd.DataFrame(mod_log), extra_cov, was_mod,
+                init_mi_sem, final_mi_sem)
 
     except Exception as e:
         st.error(f"SEM 오류: {e}")
-        return None, None, None, None, [], False
+        return None, None, None, None, [], False, pd.DataFrame(), pd.DataFrame()
 
 
 def run_correlation(df, constructs):
@@ -1065,12 +1068,14 @@ with st.spinner("분석 중입니다..."):
     if selected.get("구조방정식 (SEM)") and constructs and hypotheses:
         with st.spinner("SEM 분석 중 (MI 기반 수정 포함)..."):
             try:
-                sem_paths, fit_init_sem, fit_mod_sem, mod_log_sem, extra_cov_sem, was_mod_sem = \
+                sem_paths, fit_init_sem, fit_mod_sem, mod_log_sem, extra_cov_sem, was_mod_sem, \
+                    init_mi_sem, final_mi_sem = \
                     build_sem_table(df, constructs, hypotheses,
                                    cfa_extra_cov=cfa_extra_cov)
                 if sem_paths is not None:
                     tab_data["SEM"] = (sem_paths, fit_init_sem, fit_mod_sem,
-                                       mod_log_sem, extra_cov_sem, was_mod_sem)
+                                       mod_log_sem, extra_cov_sem, was_mod_sem,
+                                       init_mi_sem, final_mi_sem)
                     tab_labels.append("SEM")
                     xlsx_sheets["표4_가설검증"] = (
                         "SEM 가설 검증", sem_paths,
@@ -1358,7 +1363,7 @@ for tab, lbl in zip(tabs, tab_labels):
             st.caption("대각선 = √AVE | 하삼각 = 잠재변수 간 상관계수")
 
         elif lbl == "SEM":
-            paths, fit_init, fit_mod, mod_log, extra_cov, was_mod = c
+            paths, fit_init, fit_mod, mod_log, extra_cov, was_mod, init_mi_sem, final_mi_sem = c
             fit_col_order = ["χ²","df","χ²/df","p","NFI","RFI","IFI","TLI","CFI","RMSEA"]
 
             def _hl_sem(row):
@@ -1395,17 +1400,37 @@ for tab, lbl in zip(tabs, tab_labels):
 
             # ── 수정 내역 ────────────────────────────────────────────────────
             if was_mod and extra_cov:
-                st.success(f"✅ MI 기반 수정 {len(extra_cov)}회 적용")
-                paths_str = " / ".join(f"{a} ~~ {b}" for a, b in extra_cov)
+                st.success(f"✅ MI 기반 수정 {len(mod_log)}회 적용")
+                paths_str = " / ".join(f"{a} ~~ {b}" for a, b in extra_cov
+                                       if isinstance(a, str))
                 st.markdown(f"**수정된 경로:** `{paths_str}`")
                 with st.expander("📋 수정 과정 상세"):
                     st.dataframe(mod_log, use_container_width=True)
-                    st.caption("※ 같은 요인 내 잔차공분산만 추가 | MI > 3.84 (p < .05)")
+                    st.caption("※ MI > 3.84 (p < .05) 기준 적용")
             elif not was_mod:
                 if _adequate_check(fit_init):
                     st.success("✅ 초기 모형 적합도 양호 — 수정 불필요")
                 else:
-                    st.info("ℹ️ 적합도 미충족이나 같은 요인 내 MI > 3.84 쌍이 없어 수정 불가")
+                    st.info("ℹ️ 적합도 미충족이나 MI > 3.84 쌍이 없어 더 이상 수정 불가")
+
+            # ── SEM MI 테이블 (초기 / 최종) ──────────────────────────────────
+            col_mi1, col_mi2 = st.columns(2)
+            with col_mi1:
+                if init_mi_sem is not None and not init_mi_sem.empty:
+                    with st.expander("🔍 초기 수정지수(MI) 상위 20개"):
+                        d = init_mi_sem.head(20).copy()
+                        d["판정"] = d["MI"].apply(lambda v: "⚠️ 수정 고려" if v > 3.84 else "")
+                        st.dataframe(d, use_container_width=True)
+            with col_mi2:
+                if final_mi_sem is not None and not final_mi_sem.empty:
+                    with st.expander("🔍 최종 수정지수(MI) 상위 20개"):
+                        d = final_mi_sem.head(20).copy()
+                        d["판정"] = d["MI"].apply(lambda v: "⚠️ 추가 수정 가능" if v > 3.84 else "✅")
+                        st.dataframe(d, use_container_width=True)
+                        if (final_mi_sem["MI"] > 3.84).any():
+                            st.warning("최종 SEM에도 MI > 3.84 쌍이 남아 있습니다.")
+                        else:
+                            st.success("모든 잔여 MI < 3.84 — 더 이상 수정 불필요")
 
             # ── 가설 검증 결과 ────────────────────────────────────────────────
             st.markdown("---")
