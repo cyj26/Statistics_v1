@@ -62,6 +62,45 @@ except Exception as e:
 # 분석 함수들
 # ══════════════════════════════════════════════════════════════════════════════
 
+def detect_outliers_mahalanobis(df, cols, p_threshold=0.001):
+    """
+    Mahalanobis distance 기반 다변량 이상치 탐지
+    p_threshold: χ² 기준 유의수준 (기본 .001 → 엄격)
+    Returns: result_df (거리·p값·이상치 여부 포함), chi2_cutoff, outlier_indices
+    """
+    from scipy import stats as sc
+    data = df[cols].dropna()
+    n, k = data.shape
+    if n < k + 2:
+        return None, None, []
+
+    try:
+        mean    = data.mean().values
+        cov_mat = np.cov(data.values.T, ddof=1)
+        try:
+            cov_inv = np.linalg.inv(cov_mat)
+        except np.linalg.LinAlgError:
+            cov_inv = np.linalg.pinv(cov_mat)
+
+        diffs = data.values - mean
+        mahal = np.array([float(d @ cov_inv @ d) for d in diffs])
+        pvals = sc.chi2.sf(mahal, df=k)
+        cutoff = sc.chi2.ppf(1 - p_threshold, df=k)
+
+        result = pd.DataFrame({
+            "원본 행번호":       data.index + 1,       # 1-based
+            "마할라노비스 거리":  np.round(mahal, 3),
+            "p값":               np.round(pvals, 4),
+            "이상치":            mahal > cutoff,
+        }).reset_index(drop=True)
+
+        outlier_idx = data.index[mahal > cutoff].tolist()
+        return result, round(cutoff, 3), outlier_idx
+
+    except Exception as e:
+        return None, None, []
+
+
 def auto_detect_constructs(df):
     """공통 접두사 기반 구성개념 자동 탐지"""
     likert = [c for c in df.columns if detect_scale(df[c]) == "likert"]
@@ -802,6 +841,75 @@ for c in df.columns:
 st.success(f"✅ 파일 로드 완료 — {len(df)}행 × {len(df.columns)}열")
 with st.expander("📋 데이터 미리보기 (상위 10행)"):
     st.dataframe(df.head(10), use_container_width=True)
+
+# ── STEP 1-5: 이상치 탐지 (Mahalanobis Distance) ──────────────────────────────
+st.markdown("---")
+st.markdown("### 🔎 STEP 1-5. 다변량 이상치 탐지 (Mahalanobis Distance)")
+st.caption("χ² 분포 기준으로 마할라노비스 거리가 임계값을 초과하는 표본을 이상치로 탐지합니다.")
+
+num_cols_all = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+with st.expander("⚙️ 이상치 탐지 설정", expanded=True):
+    col_a, col_b = st.columns([3, 1])
+    outlier_cols = col_a.multiselect(
+        "분석에 사용할 변수 선택 (기본: 전체 수치형)",
+        num_cols_all, default=num_cols_all, key="oc_cols")
+    p_thr = col_b.selectbox(
+        "유의수준 (엄격할수록 이상치 적음)",
+        [0.001, 0.005, 0.01, 0.05], index=0, key="oc_pthr")
+
+    if outlier_cols and st.button("🔍 이상치 탐지 실행", key="oc_run"):
+        oc_result, oc_cutoff, oc_idx = detect_outliers_mahalanobis(
+            df, outlier_cols, p_threshold=p_thr)
+        st.session_state["oc_result"] = oc_result
+        st.session_state["oc_cutoff"] = oc_cutoff
+        st.session_state["oc_idx"]    = oc_idx
+
+if "oc_result" in st.session_state and st.session_state["oc_result"] is not None:
+    oc_result = st.session_state["oc_result"]
+    oc_cutoff = st.session_state["oc_cutoff"]
+    oc_idx    = st.session_state["oc_idx"]
+    n_out     = len(oc_idx)
+
+    st.markdown(f"**χ² 임계값 (df={len(outlier_cols)}, p<{p_thr}):** `{oc_cutoff}`")
+
+    col_r1, col_r2, col_r3 = st.columns(3)
+    col_r1.metric("전체 표본", len(df))
+    col_r2.metric("탐지된 이상치", n_out,
+                  delta=f"-{n_out}" if n_out > 0 else "없음",
+                  delta_color="inverse")
+    col_r3.metric("제거 후 표본", len(df) - n_out)
+
+    if n_out > 0:
+        st.markdown("**🔴 이상치로 탐지된 표본**")
+        outlier_rows = oc_result[oc_result["이상치"]].copy()
+        outlier_rows["판정"] = "⚠️ 이상치"
+
+        # 원본 데이터의 이상치 행 내용도 함께 표시
+        orig_outlier = df.iloc[oc_idx].copy().reset_index(drop=False)
+        orig_outlier = orig_outlier.rename(columns={"index": "원본 행번호(0-based)"})
+        orig_outlier.insert(0, "원본 행번호", oc_idx)
+        orig_outlier["마할라노비스 거리"] = outlier_rows["마할라노비스 거리"].values
+        orig_outlier["p값"]             = outlier_rows["p값"].values
+
+        with st.expander(f"📋 이상치 표본 상세 ({n_out}개)", expanded=True):
+            st.dataframe(orig_outlier, use_container_width=True)
+            st.caption(f"※ 마할라노비스 거리 > {oc_cutoff} (p < {p_thr}) 기준")
+
+        st.markdown("**전체 탐지 결과 (마할라노비스 거리 내림차순)**")
+        disp_all = oc_result.sort_values("마할라노비스 거리", ascending=False).copy()
+        disp_all["판정"] = disp_all["이상치"].map({True: "⚠️ 이상치", False: "✅ 정상"})
+        disp_all = disp_all.drop(columns=["이상치"])
+        st.dataframe(disp_all, use_container_width=True, hide_index=True)
+
+        remove_outliers = st.checkbox(
+            f"✅ 이상치 {n_out}개를 분석에서 제외하고 진행 (권장)",
+            value=True, key="oc_remove")
+        if remove_outliers:
+            df = df.drop(index=oc_idx).reset_index(drop=True)
+            st.success(f"✅ 이상치 {n_out}개 제거 완료 — 분석 표본: **{len(df)}개**")
+    else:
+        st.success("✅ 이상치가 탐지되지 않았습니다. 전체 표본으로 분석을 진행합니다.")
 
 # ── STEP 2: 구성개념 탐지 ─────────────────────────────────────────────────────
 st.markdown("---")
