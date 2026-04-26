@@ -1,5 +1,5 @@
 # =============================================================================
-# 📊 통계 자동 분석기
+# 최영진의 통계 자동 분석기
 # 실행: python -m streamlit run app.py
 # =============================================================================
 import streamlit as st
@@ -8,7 +8,7 @@ import numpy as np
 import re
 from collections import defaultdict
 
-st.set_page_config(page_title="📊 통계 자동 분석기",
+st.set_page_config(page_title="최영진의 통계 자동 분석기",
                    page_icon="📊", layout="wide")
 
 # ── 비밀번호 잠금 ─────────────────────────────────────────────────────────────
@@ -70,6 +70,13 @@ def auto_detect_constructs(df):
         m = re.match(r'^([A-Za-z]+\d*)(\d)$', col)
         groups[m.group(1) if m else col].append(col)
     return {k: v for k, v in groups.items() if len(v) >= 2}
+
+
+def _adequate_check(fit):
+    """NFI·RFI·IFI·TLI·CFI ≥ .90 AND RMSEA < .049"""
+    return (fit.get("NFI",0)>=.90 and fit.get("RFI",0)>=.90 and
+            fit.get("IFI",0)>=.90 and fit.get("TLI",0)>=.90 and
+            fit.get("CFI",0)>=.90 and fit.get("RMSEA",1)<.049)
 
 
 def get_composite_scores(df, constructs):
@@ -164,13 +171,7 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=50):
                 return {}
 
         def _adequate(fit):
-            """모든 적합도 기준 충족 여부"""
-            return (fit.get("NFI",  0) >= 0.90 and
-                    fit.get("RFI",  0) >= 0.90 and
-                    fit.get("IFI",  0) >= 0.90 and
-                    fit.get("TLI",  0) >= 0.90 and
-                    fit.get("CFI",  0) >= 0.90 and
-                    fit.get("RMSEA", 1) <  0.049)
+            return _adequate_check(fit)
 
         def _inspect(m):
             ins     = m.inspect(std_est=True)
@@ -413,56 +414,168 @@ def build_cfa_tables(df, constructs, mi_threshold=3.84, max_mods=50):
         return None, None, None, None, None, None, False, []
 
 
-def build_sem_table(df, constructs, hypotheses):
-    ins, std_col, _, fit = run_cfa_sem(df, constructs, hypotheses)
-    if ins is None:
-        return None, None
+def build_sem_table(df, constructs, hypotheses,
+                    cfa_extra_cov=None, mi_threshold=3.84, max_mods=50):
+    """
+    SEM 추정 → 적합도 미충족 시 MI 기반 수정모형 반복
+    cfa_extra_cov: CFA 단계에서 확정된 잔차공분산 목록 (2단계 접근법)
+    Returns (path_df, init_fit, mod_fit, mod_log, extra_cov, was_modified)
+    """
+    try:
+        from semopy import Model, calc_stats
+    except ImportError:
+        st.error("semopy 패키지가 필요합니다.")
+        return None, None, None, None, [], False
 
     try:
-        lv_names  = set(constructs.keys())
-        all_items = set(i for v in constructs.values() for i in v)
+        item_to_lv = {item: lv for lv, items in constructs.items() for item in items}
+        all_items  = [i for items in constructs.values() for i in items]
+        lv_names   = set(constructs.keys())
+        data       = df[all_items].dropna()
 
-        # 구조 경로: lval·rval 모두 잠재변수 (측정모형 제외)
-        struct_mask = ins["lval"].isin(lv_names) & ins["rval"].isin(lv_names)
-        path_df = ins[struct_mask].copy()
+        # ── 측정모형 (CFA 확정 공분산 포함) + 구조경로 ───────────────────────
+        meas_str = "\n".join(f"  {lv} =~ {' + '.join(items)}"
+                             for lv, items in constructs.items())
+        # CFA에서 확정된 잔차공분산 이어받기 (Anderson & Gerbing 2단계)
+        cfa_cov  = cfa_extra_cov or []
+        cov_str  = ("\n" + "\n".join(f"  {a} ~~ {b}" for a, b in cfa_cov)
+                    if cfa_cov else "")
+        deps = defaultdict(list)
+        for s, t in hypotheses:
+            deps[t].append(s)
+        struct_str = "\n".join(f"  {t} ~ {' + '.join(ss)}"
+                               for t, ss in deps.items())
+        base_str = meas_str + cov_str + "\n" + struct_str
 
-        cols_needed = ["lval", "rval", "Estimate", std_col, "Std. Err", "z-value", "p-value"]
-        cols_needed = [c for c in cols_needed if c in path_df.columns]
-        path_df = path_df[cols_needed].copy()
-
-        rename_map = {"lval":"종속변수","rval":"독립변수",
-                      "Estimate":"비표준화β", std_col:"표준화β",
-                      "Std. Err":"SE","z-value":"C.R.","p-value":"p값_raw"}
-        path_df = path_df.rename(columns=rename_map)
-
-        hyp_map = {(s, t): f"H{i+1}" for i, (s, t) in enumerate(hypotheses)}
-        path_df["가설"] = path_df.apply(
-            lambda r: hyp_map.get((r["독립변수"], r["종속변수"]), "-"), axis=1)
-        path_df["경로"] = path_df["독립변수"] + " → " + path_df["종속변수"]
-        def _safe_p(p):
+        def _fit_model(model_str):
             try:
-                return float(p) if str(p).strip() not in ("-", "", "nan") else np.nan
+                m = Model(model_str); m.fit(data); return m
             except Exception:
-                return np.nan
+                return None
 
-        path_df["유의성"]  = path_df["p값_raw"].apply(lambda p: sig_stars(_safe_p(p)))
-        path_df["채택여부"] = path_df["p값_raw"].apply(
-            lambda p: ("채택" if _safe_p(p) < 0.05 else "기각")
-            if not np.isnan(_safe_p(p)) else "해당없음")
-        path_df["p값"]     = path_df["p값_raw"].apply(
-            lambda p: fmt_p(_safe_p(p)) if not np.isnan(_safe_p(p)) else "-")
+        def _extract_fit(m):
+            try:
+                sd      = calc_stats(m).iloc[0].to_dict()
+                chi2    = float(sd.get("chi2", 0))
+                dof     = float(sd.get("DoF", 1))
+                chi2_bl = float(sd.get("chi2 Baseline", 0))
+                dof_bl  = float(sd.get("DoF Baseline", 1))
+                pval    = float(sd.get("chi2 p-value", 1))
+                cfi     = float(sd.get("CFI", 0))
+                tli     = float(sd.get("TLI", 0))
+                nfi     = float(sd.get("NFI", 0))
+                rmsea   = float(sd.get("RMSEA", 1))
+                rfi = ((chi2_bl/dof_bl - chi2/dof) / (chi2_bl/dof_bl)
+                       if chi2_bl > 0 and dof_bl > 0 and dof > 0 else 0.0)
+                ifi = ((chi2_bl - chi2) / (chi2_bl - dof)
+                       if (chi2_bl - dof) > 0 else 0.0)
+                return {"χ²": round(chi2,3), "df": int(dof),
+                        "χ²/df": round(chi2/dof,3) if dof>0 else "-",
+                        "p": round(pval,3),
+                        "NFI": round(nfi,3), "RFI": round(rfi,3),
+                        "IFI": round(ifi,3), "TLI": round(tli,3),
+                        "CFI": round(cfi,3), "RMSEA": round(rmsea,3)}
+            except Exception:
+                return {}
 
-        num_cols = [c for c in ["비표준화β","표준화β","SE","C.R."] if c in path_df.columns]
-        for col in num_cols:
-            path_df[col] = pd.to_numeric(path_df[col], errors="coerce").round(3)
+        def _adequate(fit):
+            return (fit.get("NFI",0)>=.90 and fit.get("RFI",0)>=.90 and
+                    fit.get("IFI",0)>=.90 and fit.get("TLI",0)>=.90 and
+                    fit.get("CFI",0)>=.90 and fit.get("RMSEA",1)<.049)
 
-        out_cols = ["가설","경로","표준화β","SE","C.R.","p값","유의성","채택여부"]
-        out_cols = [c for c in out_cols if c in path_df.columns]
-        return path_df[out_cols], fit
+        def _extract_paths(m):
+            ins     = m.inspect(std_est=True)
+            std_col = next((c for c in ins.columns if "std" in c.lower()),
+                           ins.columns[-1])
+            struct  = ins[ins["lval"].isin(lv_names) & ins["rval"].isin(lv_names)].copy()
+            cols    = ["lval","rval","Estimate",std_col,"Std. Err","z-value","p-value"]
+            cols    = [c for c in cols if c in struct.columns]
+            struct  = struct[cols].copy()
+            rm      = {"lval":"종속변수","rval":"독립변수",
+                       "Estimate":"비표준화β", std_col:"표준화β",
+                       "Std. Err":"SE","z-value":"C.R.","p-value":"p값_raw"}
+            struct  = struct.rename(columns=rm)
+            hyp_map = {(s,t): f"H{i+1}" for i,(s,t) in enumerate(hypotheses)}
+            struct["가설"] = struct.apply(
+                lambda r: hyp_map.get((r["독립변수"],r["종속변수"]),"-"), axis=1)
+            struct["경로"] = struct["독립변수"] + " → " + struct["종속변수"]
+            def _sp(p):
+                try: return float(p) if str(p).strip() not in("-","","nan") else np.nan
+                except: return np.nan
+            struct["유의성"]  = struct["p값_raw"].apply(lambda p: sig_stars(_sp(p)))
+            struct["채택여부"] = struct["p값_raw"].apply(
+                lambda p: ("채택" if _sp(p)<0.05 else "기각")
+                if not np.isnan(_sp(p)) else "해당없음")
+            struct["p값"] = struct["p값_raw"].apply(
+                lambda p: fmt_p(_sp(p)) if not np.isnan(_sp(p)) else "-")
+            for col in [c for c in ["비표준화β","표준화β","SE","C.R."] if c in struct.columns]:
+                struct[col] = pd.to_numeric(struct[col], errors="coerce").round(3)
+            out = ["가설","경로","표준화β","SE","C.R.","p값","유의성","채택여부"]
+            return struct[[c for c in out if c in struct.columns]]
+
+        # ── 초기 SEM ──────────────────────────────────────────────────────────
+        m0 = _fit_model(base_str)
+        if m0 is None:
+            st.error("SEM 초기 추정 실패")
+            return None, None, None, None, [], False
+        fit0   = _extract_fit(m0)
+        path0  = _extract_paths(m0)
+
+        # ── MI 기반 반복 수정 ─────────────────────────────────────────────────
+        extra_cov   = []
+        added_pairs = set()
+        mod_log     = []
+        m_cur       = m0
+        fit_cur     = fit0.copy()
+
+        for _ in range(max_mods):
+            if _adequate(fit_cur):
+                break
+            mi_cur = calc_mi_approx(m_cur, data, all_items)
+            high   = mi_cur[mi_cur["MI"] > mi_threshold]
+            if high.empty:
+                break
+            improved = False
+            for _, row in high.iterrows():
+                v1, v2 = row["변수1"], row["변수2"]
+                pair   = tuple(sorted([v1, v2]))
+                if pair in added_pairs:
+                    continue
+                if item_to_lv.get(v1) != item_to_lv.get(v2):
+                    continue
+                new_cov = extra_cov + [(v1, v2)]
+                new_str = (base_str + "\n" +
+                           "\n".join(f"  {a} ~~ {b}" for a, b in new_cov))
+                m_new   = _fit_model(new_str)
+                if m_new is None:
+                    continue
+                fit_new = _extract_fit(m_new)
+                mod_log.append({
+                    "수정 경로":   f"{v1} ~~ {v2}",
+                    "소속 요인":   item_to_lv.get(v1,"-"),
+                    "MI":          row["MI"],
+                    "CFI 전→후":   f"{fit_cur.get('CFI','-')} → {fit_new.get('CFI','-')}",
+                    "RMSEA 전→후": f"{fit_cur.get('RMSEA','-')} → {fit_new.get('RMSEA','-')}",
+                })
+                extra_cov   = new_cov
+                m_cur       = m_new
+                fit_cur     = fit_new
+                added_pairs.add(pair)
+                improved    = True
+                break
+            if not improved:
+                break
+
+        # 수정 후 경로 재추출
+        path_final = _extract_paths(m_cur) if extra_cov else path0
+        was_mod    = len(extra_cov) > 0
+
+        return (path_final, fit0, fit_cur,
+                pd.DataFrame(mod_log), extra_cov, was_mod)
 
     except Exception as e:
-        st.error(f"SEM 결과 처리 오류: {e}")
-        return None, None
+        st.error(f"SEM 오류: {e}")
+        return None, None, None, None, [], False
 
 
 def run_correlation(df, constructs):
@@ -833,9 +946,10 @@ st.markdown("---")
 if not st.button("🚀 분석 실행", type="primary", use_container_width=True):
     st.stop()
 
-xlsx_sheets = {}
-tab_labels  = []
-tab_data    = {}
+xlsx_sheets   = {}
+tab_labels    = []
+tab_data      = {}
+cfa_extra_cov = []   # CFA 확정 잔차공분산 → SEM에 전달
 
 with st.spinner("분석 중입니다..."):
 
@@ -894,6 +1008,7 @@ with st.spinner("분석 중입니다..."):
                 loads, rel_df, fit_init, fit_mod, mi_df, mod_log, was_mod, extra_cov = \
                     build_cfa_tables(df, constructs)
                 if loads is not None:
+                    cfa_extra_cov = extra_cov   # SEM 2단계에 전달
                     tab_data["CFA"] = (loads, rel_df, fit_init, fit_mod,
                                        mi_df, mod_log, was_mod, extra_cov)
                     tab_labels.append("CFA")
@@ -926,17 +1041,23 @@ with st.spinner("분석 중입니다..."):
 
     # SEM
     if selected.get("구조방정식 (SEM)") and constructs and hypotheses:
-        with st.spinner("SEM 분석 중..."):
+        with st.spinner("SEM 분석 중 (MI 기반 수정 포함)..."):
             try:
-                sem_paths, fit_sem = build_sem_table(df, constructs, hypotheses)
+                sem_paths, fit_init_sem, fit_mod_sem, mod_log_sem, extra_cov_sem, was_mod_sem = \
+                    build_sem_table(df, constructs, hypotheses,
+                                   cfa_extra_cov=cfa_extra_cov)
                 if sem_paths is not None:
-                    tab_data["SEM"] = (sem_paths, fit_sem)
+                    tab_data["SEM"] = (sem_paths, fit_init_sem, fit_mod_sem,
+                                       mod_log_sem, extra_cov_sem, was_mod_sem)
                     tab_labels.append("SEM")
                     xlsx_sheets["표4_가설검증"] = (
                         "SEM 가설 검증", sem_paths,
                         "※ ***p<.001 **p<.01 *p<.05 n.s.=유의하지않음", "채택여부")
+                    if was_mod_sem and not mod_log_sem.empty:
+                        xlsx_sheets["SEM_수정과정"] = (
+                            "SEM — MI 기반 수정 과정", mod_log_sem, "※ MI>3.84 기준")
                 else:
-                    st.warning("⚠️ SEM 결과를 생성하지 못했습니다. CFA가 정상적으로 실행되어야 SEM도 가능합니다.")
+                    st.warning("⚠️ SEM 결과를 생성하지 못했습니다.")
             except Exception as e:
                 st.warning(f"SEM 오류: {e}")
 
@@ -1181,34 +1302,20 @@ for tab, lbl in zip(tabs, tab_labels):
             st.caption("대각선 = √AVE | 하삼각 = 잠재변수 간 상관계수")
 
         elif lbl == "SEM":
-            paths, fit = c
-
-            # ── 가설 검증 결과 ────────────────────────────────────────────────
-            def hl(row):
-                color = "#E8F5E9" if row.get("채택여부") == "채택" else "#FFF3F3"
-                return [f"background-color:{color}"] * len(row)
-            st.dataframe(paths.style.apply(hl, axis=1), use_container_width=True)
-            n_adopt = (paths["채택여부"] == "채택").sum()
-            st.markdown(f"**채택: {n_adopt}개 / 기각: {len(paths)-n_adopt}개 / 전체: {len(paths)}개**")
-
-            # ── 모델 적합도 (색상 강조) ───────────────────────────────────────
-            st.markdown("**모델 적합도**")
+            paths, fit_init, fit_mod, mod_log, extra_cov, was_mod = c
             fit_col_order = ["χ²","df","χ²/df","p","NFI","RFI","IFI","TLI","CFI","RMSEA"]
-            fit_row = {k: fit.get(k, "-") for k in fit_col_order}
-            fit_df  = pd.DataFrame([fit_row])
 
             def _hl_sem(row):
                 checks = {"NFI":.90,"RFI":.90,"IFI":.90,"TLI":.90,"CFI":.90}
                 colors = []
                 for col in row.index:
-                    v = row[col]
                     try:
-                        fv = float(v)
+                        fv = float(row[col])
                         if col in checks:
-                            colors.append("background-color:#E8F5E9" if fv >= checks[col]
+                            colors.append("background-color:#E8F5E9" if fv>=checks[col]
                                           else "background-color:#FFE0E0")
                         elif col == "RMSEA":
-                            colors.append("background-color:#E8F5E9" if fv < 0.049
+                            colors.append("background-color:#E8F5E9" if fv<0.049
                                           else "background-color:#FFE0E0")
                         else:
                             colors.append("")
@@ -1216,8 +1323,43 @@ for tab, lbl in zip(tabs, tab_labels):
                         colors.append("")
                 return colors
 
-            st.dataframe(fit_df.style.apply(_hl_sem, axis=1), use_container_width=True)
+            # ── 적합도 비교 ──────────────────────────────────────────────────
+            st.markdown("**모델 적합도**")
+            if was_mod:
+                fit_cmp = pd.DataFrame([
+                    {"모형":"초기 모형", **{k: fit_init.get(k,"-") for k in fit_col_order}},
+                    {"모형":"수정 모형", **{k: fit_mod.get(k,"-")  for k in fit_col_order}},
+                ])
+            else:
+                fit_cmp = pd.DataFrame([
+                    {"모형":"초기 모형", **{k: fit_init.get(k,"-") for k in fit_col_order}}
+                ])
+            st.dataframe(fit_cmp.style.apply(_hl_sem, axis=1), use_container_width=True)
             st.caption(FIT_NOTE)
+
+            # ── 수정 내역 ────────────────────────────────────────────────────
+            if was_mod and extra_cov:
+                st.success(f"✅ MI 기반 수정 {len(extra_cov)}회 적용")
+                paths_str = " / ".join(f"{a} ~~ {b}" for a, b in extra_cov)
+                st.markdown(f"**수정된 경로:** `{paths_str}`")
+                with st.expander("📋 수정 과정 상세"):
+                    st.dataframe(mod_log, use_container_width=True)
+                    st.caption("※ 같은 요인 내 잔차공분산만 추가 | MI > 3.84 (p < .05)")
+            elif not was_mod:
+                if _adequate_check(fit_init):
+                    st.success("✅ 초기 모형 적합도 양호 — 수정 불필요")
+                else:
+                    st.info("ℹ️ 적합도 미충족이나 같은 요인 내 MI > 3.84 쌍이 없어 수정 불가")
+
+            # ── 가설 검증 결과 ────────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("**가설 검증 결과** (수정모형 기준)")
+            def hl(row):
+                color = "#E8F5E9" if row.get("채택여부") == "채택" else "#FFF3F3"
+                return [f"background-color:{color}"] * len(row)
+            st.dataframe(paths.style.apply(hl, axis=1), use_container_width=True)
+            n_adopt = (paths["채택여부"] == "채택").sum()
+            st.markdown(f"**채택: {n_adopt}개 / 기각: {len(paths)-n_adopt}개 / 전체: {len(paths)}개**")
 
         elif lbl == "회귀분석":
             coef, summ = c
