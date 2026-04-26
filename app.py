@@ -109,11 +109,12 @@ def calc_mi_approx(model, obs_df, obs_vars):
         return pd.DataFrame()
 
 
-def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=50):
+def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=200):
     """
-    초기 CFA → MI 계산 → 같은 요인 내 잔차공분산 반복 추가 → 수정모형
-    적합도 기준: NFI·RFI·IFI·TLI·CFI ≥ .90, RMSEA < .049
-    MI 기준: MI > 3.84 (χ² 임계값, p<.05)
+    CFA → MI 기반 무한 반복 수정 (R lavaan auto_refit_all_criteria와 동일 로직)
+    - 요인분산=1 고정 → 모든 문항 SE·t·p 산출 (참조지표 없음)
+    - MI > 3.84 이면 요인 구분 없이 가장 높은 쌍 추가
+    - NFI·RFI·IFI·TLI·CFI ≥ .90 AND RMSEA < .049 충족까지 반복
     Returns (result_dict, error_str)
     """
     try:
@@ -126,12 +127,11 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=50):
         all_items  = [i for items in constructs.values() for i in items]
         data       = df[all_items].dropna()
 
-        meas_lines    = [f"  {lv} =~ {' + '.join(items)}"
-                         for lv, items in constructs.items()]
-        meas_only_str = "\n".join(meas_lines)
-        # 요인분산=1 고정 → 모든 문항 SE·t·p 산출
-        var_lines  = [f"  {lv} ~~ 1 * {lv}" for lv in constructs.keys()]
-        base_str_v1 = meas_only_str + "\n" + "\n".join(var_lines)
+        # ── 모형 문자열 (요인분산=1 고정 우선, 실패 시 참조지표 방식) ─────────
+        meas_lines = [f"  {lv} =~ {' + '.join(items)}"
+                      for lv, items in constructs.items()]
+        meas_str   = "\n".join(meas_lines)
+        var_str    = "\n".join(f"  {lv} ~~ 1*{lv}" for lv in constructs.keys())
 
         def _fit(model_str):
             try:
@@ -139,15 +139,12 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=50):
             except Exception:
                 return None
 
-        # 요인분산 고정 방식 먼저 시도, 실패 시 참조지표 방식 폴백
-        _test = _fit(base_str_v1)
-        if _test is not None:
-            base_str = base_str_v1
-        else:
-            base_str = meas_only_str   # 참조지표(기본) 방식
+        # 요인분산=1 고정 시도 → 모든 문항 SE·t·p 산출 가능
+        base_str = meas_str + "\n" + var_str
+        if _fit(base_str) is None:
+            base_str = meas_str      # 폴백: 참조지표 방식
 
         def _extract_fit(m):
-            """χ², df, χ²/df, p, NFI, RFI, IFI, TLI, CFI, RMSEA 계산"""
             try:
                 sd      = calc_stats(m).iloc[0].to_dict()
                 chi2    = float(sd.get("chi2", 0))
@@ -159,113 +156,89 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=50):
                 tli     = float(sd.get("TLI", 0))
                 nfi     = float(sd.get("NFI", 0))
                 rmsea   = float(sd.get("RMSEA", 1))
-
-                # RFI = (χ²₀/df₀ − χ²/df) / (χ²₀/df₀)
-                rfi = ((chi2_bl / dof_bl - chi2 / dof) / (chi2_bl / dof_bl)
-                       if chi2_bl > 0 and dof_bl > 0 and dof > 0 else 0.0)
-                # IFI (Bollen Δ₂) = (χ²₀ − χ²) / (χ²₀ − df)
+                rfi = ((chi2_bl/dof_bl - chi2/dof) / (chi2_bl/dof_bl)
+                       if chi2_bl>0 and dof_bl>0 and dof>0 else 0.0)
                 ifi = ((chi2_bl - chi2) / (chi2_bl - dof)
                        if (chi2_bl - dof) > 0 else 0.0)
-
-                return {
-                    "χ²":     round(chi2, 3),
-                    "df":     int(dof),
-                    "χ²/df":  round(chi2 / dof, 3) if dof > 0 else "-",
-                    "p":      round(pval, 3),
-                    "NFI":    round(nfi, 3),
-                    "RFI":    round(rfi, 3),
-                    "IFI":    round(ifi, 3),
-                    "TLI":    round(tli, 3),
-                    "CFI":    round(cfi, 3),
-                    "RMSEA":  round(rmsea, 3),
-                }
+                return {"χ²": round(chi2,3), "df": int(dof),
+                        "χ²/df": round(chi2/dof,3) if dof>0 else "-",
+                        "p": round(pval,3),
+                        "NFI": round(nfi,3), "RFI": round(rfi,3),
+                        "IFI": round(ifi,3), "TLI": round(tli,3),
+                        "CFI": round(cfi,3), "RMSEA": round(rmsea,3)}
             except Exception:
                 return {}
 
-        def _adequate(fit):
-            return _adequate_check(fit)
-
-        def _inspect(m):
-            ins     = m.inspect(std_est=True)
-            std_col = next((c for c in ins.columns if "std" in c.lower()),
-                           ins.columns[-1])
-            return ins, std_col
-
         # ── 초기 모형 ─────────────────────────────────────────────────────────
-        m0     = _fit(base_str)
+        m0 = _fit(base_str)
         if m0 is None:
             return None, "초기 CFA 추정 실패"
         fit0   = _extract_fit(m0)
         mi_df0 = calc_mi_approx(m0, data, all_items)
 
-        # ── MI 기반 반복 수정 ─────────────────────────────────────────────────
+        # ── MI 기반 반복 수정 (R auto_refit_all_criteria와 동일) ──────────────
         extra_cov   = []
         added_pairs = set()
         mod_log     = []
-        m_cur       = m0
-        fit_cur     = fit0.copy()
-        mi_cur      = mi_df0.copy()
+        m_cur, fit_cur, mi_cur = m0, fit0.copy(), mi_df0.copy()
 
-        for _ in range(max_mods):
-            if _adequate(fit_cur):
-                break                           # 모든 기준 충족
-            high_mi = mi_cur[mi_cur["MI"] > mi_threshold]
-            if high_mi.empty:
-                break                           # 추가할 MI 없음
+        for step in range(max_mods):
+            if _adequate_check(fit_cur):
+                break                           # ✅ 모든 기준 충족
 
-            improved = False
-            for _, row in high_mi.iterrows():
-                v1, v2 = row["변수1"], row["변수2"]
-                pair   = tuple(sorted([v1, v2]))
-                if pair in added_pairs:
-                    continue
-                if item_to_lv.get(v1) != item_to_lv.get(v2):
-                    continue                    # 같은 요인 내만 허용
+            # 미추가 쌍 중 MI 최대값 선택 (요인 구분 없음 — R과 동일)
+            avail = mi_cur[
+                (mi_cur["MI"] > mi_threshold) &
+                (~mi_cur.apply(
+                    lambda r: tuple(sorted([r["변수1"], r["변수2"]])) in added_pairs,
+                    axis=1))
+            ]
+            if avail.empty:
+                break                           # 더 이상 추가할 MI 없음
 
-                new_cov = extra_cov + [(v1, v2)]
-                # base_str 이미 var_lines 포함 → 잔차공분산만 추가
-                new_str = (base_str + "\n" +
-                           "\n".join(f"  {a} ~~ {b}" for a, b in new_cov))
-                m_new   = _fit(new_str)
-                if m_new is None:
-                    continue
-                fit_new = _extract_fit(m_new)
+            row    = avail.iloc[0]              # MI 내림차순 정렬 → 최대값
+            v1, v2 = row["변수1"], row["변수2"]
+            pair   = tuple(sorted([v1, v2]))
 
-                mod_log.append({
-                    "수정 경로":    f"{v1} ~~ {v2}",
-                    "소속 요인":    item_to_lv.get(v1, "-"),
-                    "MI":           row["MI"],
-                    "CFI 전→후":    f"{fit_cur.get('CFI','-')} → {fit_new.get('CFI','-')}",
-                    "RMSEA 전→후":  f"{fit_cur.get('RMSEA','-')} → {fit_new.get('RMSEA','-')}",
-                    "RFI 전→후":    f"{fit_cur.get('RFI','-')} → {fit_new.get('RFI','-')}",
-                    "IFI 전→후":    f"{fit_cur.get('IFI','-')} → {fit_new.get('IFI','-')}",
-                })
-                extra_cov   = new_cov
-                m_cur       = m_new
-                fit_cur     = fit_new
-                added_pairs.add(pair)
-                mi_cur      = calc_mi_approx(m_cur, data, all_items)
-                improved    = True
-                break
+            new_cov = extra_cov + [(v1, v2)]
+            new_str = (base_str + "\n" +
+                       "\n".join(f"  {a} ~~ {b}" for a, b in new_cov))
+            m_new = _fit(new_str)
+            if m_new is None:
+                added_pairs.add(pair)           # 실패한 쌍 스킵
+                continue
+            fit_new = _extract_fit(m_new)
 
-            if not improved:
-                break                           # 같은 요인 내 추가 MI 없음
+            lv1 = item_to_lv.get(v1, v1)
+            lv2 = item_to_lv.get(v2, v2)
+            mod_log.append({
+                "단계":         step + 1,
+                "수정 경로":    f"{v1} ~~ {v2}",
+                "소속 요인":    lv1 if lv1 == lv2 else f"{lv1}↔{lv2}",
+                "MI":           round(row["MI"], 3),
+                "CFI 전→후":    f"{fit_cur.get('CFI','-')} → {fit_new.get('CFI','-')}",
+                "RMSEA 전→후":  f"{fit_cur.get('RMSEA','-')} → {fit_new.get('RMSEA','-')}",
+                "RFI 전→후":    f"{fit_cur.get('RFI','-')} → {fit_new.get('RFI','-')}",
+                "IFI 전→후":    f"{fit_cur.get('IFI','-')} → {fit_new.get('IFI','-')}",
+            })
+            extra_cov = new_cov
+            m_cur, fit_cur = m_new, fit_new
+            added_pairs.add(pair)
+            mi_cur = calc_mi_approx(m_cur, data, all_items)
 
-        ins_cur, std_col = _inspect(m_cur)
+        ins     = m_cur.inspect(std_est=True)
+        std_col = next((c for c in ins.columns if "std" in c.lower()), ins.columns[-1])
 
         return {
-            "init_model":   m0,
-            "mod_model":    m_cur,
-            "init_fit":     fit0,
-            "mod_fit":      fit_cur,
+            "init_model":   m0,   "mod_model":    m_cur,
+            "init_fit":     fit0, "mod_fit":      fit_cur,
             "init_mi":      mi_df0,
             "mod_log":      pd.DataFrame(mod_log),
-            "extra_cov":    extra_cov,          # 수정된 경로 목록
+            "extra_cov":    extra_cov,
             "was_modified": len(extra_cov) > 0,
-            "ins":          ins_cur,
-            "std_col":      std_col,
-            "data":         data,
-            "all_items":    all_items,
+            "ins": ins, "std_col": std_col,
+            "data": data, "all_items": all_items,
+            "base_str": base_str,              # SEM에 전달
         }, None
 
     except Exception as e:
@@ -436,7 +409,7 @@ def build_cfa_tables(df, constructs, mi_threshold=3.84, max_mods=50):
 
 
 def build_sem_table(df, constructs, hypotheses,
-                    cfa_extra_cov=None, mi_threshold=3.84, max_mods=50):
+                    cfa_extra_cov=None, mi_threshold=3.84, max_mods=200):
     """
     SEM 추정 → 적합도 미충족 시 MI 기반 수정모형 반복
     cfa_extra_cov: CFA 단계에서 확정된 잔차공분산 목록 (2단계 접근법)
@@ -454,34 +427,11 @@ def build_sem_table(df, constructs, hypotheses,
         lv_names   = set(constructs.keys())
         data       = df[all_items].dropna()
 
-        # ── 측정모형 + CFA 확정 공분산 + 구조경로 ───────────────────────────
-        meas_lines    = [f"  {lv} =~ {' + '.join(items)}"
-                         for lv, items in constructs.items()]
-        var_lines     = [f"  {lv} ~~ 1 * {lv}" for lv in constructs.keys()]
-        meas_only_str = "\n".join(meas_lines)
-        meas_var_str  = meas_only_str + "\n" + "\n".join(var_lines)
-
-        cfa_cov  = cfa_extra_cov or []
-        cov_str  = ("\n" + "\n".join(f"  {a} ~~ {b}" for a, b in cfa_cov)
-                    if cfa_cov else "")
-        deps = defaultdict(list)
-        for s, t in hypotheses:
-            deps[t].append(s)
-        struct_str = "\n".join(f"  {t} ~ {' + '.join(ss)}"
-                               for t, ss in deps.items())
-
-        # 요인분산=1 먼저 시도, 실패 시 참조지표 방식 폴백
         def _fit_model(model_str):
             try:
                 m = Model(model_str); m.fit(data); return m
             except Exception:
                 return None
-
-        _test_base = _fit_model(meas_var_str + cov_str + "\n" + struct_str)
-        if _test_base is not None:
-            base_str = meas_var_str + cov_str + "\n" + struct_str
-        else:
-            base_str = meas_only_str + cov_str + "\n" + struct_str
 
         def _extract_fit(m):
             try:
@@ -496,7 +446,7 @@ def build_sem_table(df, constructs, hypotheses,
                 nfi     = float(sd.get("NFI", 0))
                 rmsea   = float(sd.get("RMSEA", 1))
                 rfi = ((chi2_bl/dof_bl - chi2/dof) / (chi2_bl/dof_bl)
-                       if chi2_bl > 0 and dof_bl > 0 and dof > 0 else 0.0)
+                       if chi2_bl>0 and dof_bl>0 and dof>0 else 0.0)
                 ifi = ((chi2_bl - chi2) / (chi2_bl - dof)
                        if (chi2_bl - dof) > 0 else 0.0)
                 return {"χ²": round(chi2,3), "df": int(dof),
@@ -508,22 +458,17 @@ def build_sem_table(df, constructs, hypotheses,
             except Exception:
                 return {}
 
-        def _adequate(fit):
-            return (fit.get("NFI",0)>=.90 and fit.get("RFI",0)>=.90 and
-                    fit.get("IFI",0)>=.90 and fit.get("TLI",0)>=.90 and
-                    fit.get("CFI",0)>=.90 and fit.get("RMSEA",1)<.049)
-
         def _extract_paths(m):
             ins     = m.inspect(std_est=True)
-            std_col = next((c for c in ins.columns if "std" in c.lower()),
-                           ins.columns[-1])
+            std_col = next((c for c in ins.columns if "std" in c.lower()), ins.columns[-1])
+            # semopy 2.x: 구조경로는 lval·rval 모두 잠재변수이면서 op가 측정모형이 아닌 것
             struct  = ins[ins["lval"].isin(lv_names) & ins["rval"].isin(lv_names)].copy()
-            cols    = ["lval","rval","Estimate",std_col,"Std. Err","z-value","p-value"]
+            cols    = ["lval","rval", std_col, "Std. Err", "z-value", "p-value"]
             cols    = [c for c in cols if c in struct.columns]
             struct  = struct[cols].copy()
             rm      = {"lval":"종속변수","rval":"독립변수",
-                       "Estimate":"비표준화β", std_col:"표준화β",
-                       "Std. Err":"SE","z-value":"C.R.","p-value":"p값_raw"}
+                       std_col:"표준화β", "Std. Err":"SE",
+                       "z-value":"t값", "p-value":"p값_raw"}
             struct  = struct.rename(columns=rm)
             hyp_map = {(s,t): f"H{i+1}" for i,(s,t) in enumerate(hypotheses)}
             struct["가설"] = struct.apply(
@@ -535,70 +480,97 @@ def build_sem_table(df, constructs, hypotheses,
             struct["유의성"]  = struct["p값_raw"].apply(lambda p: sig_stars(_sp(p)))
             struct["채택여부"] = struct["p값_raw"].apply(
                 lambda p: ("채택" if _sp(p)<0.05 else "기각")
-                if not np.isnan(_sp(p)) else "해당없음")
+                if not np.isnan(_sp(p)) else "-")
             struct["p값"] = struct["p값_raw"].apply(
                 lambda p: fmt_p(_sp(p)) if not np.isnan(_sp(p)) else "-")
-            for col in [c for c in ["비표준화β","표준화β","SE","C.R."] if c in struct.columns]:
+            for col in [c for c in ["표준화β","SE","t값"] if c in struct.columns]:
                 struct[col] = pd.to_numeric(struct[col], errors="coerce").round(3)
-            out = ["가설","경로","표준화β","SE","C.R.","p값","유의성","채택여부"]
-            return struct[[c for c in out if c in struct.columns]]
+            out = ["가설","경로","표준화β","SE","t값","p값","유의성","채택여부"]
+            return struct[[c for c in out if c in struct.columns]].reset_index(drop=True)
+
+        # ── CFA 확정 잔차공분산 + 구조경로로 base_str 구성 (R sem_mi_syntax와 동일) ──
+        # cfa_extra_cov: CFA 단계 extra_cov (수정된 잔차공분산 목록)
+        cfa_base = (cfa_extra_cov[0] if cfa_extra_cov and isinstance(cfa_extra_cov[0], str)
+                    else None)
+        # cfa_extra_cov 가 (base_str, extra_pairs) 형태인지 list of tuples인지 처리
+        cfa_cov_pairs = cfa_extra_cov if isinstance(cfa_extra_cov, list) and \
+                        (not cfa_extra_cov or isinstance(cfa_extra_cov[0], tuple)) \
+                        else []
+
+        meas_lines = [f"  {lv} =~ {' + '.join(items)}"
+                      for lv, items in constructs.items()]
+        meas_str   = "\n".join(meas_lines)
+        var_str    = "\n".join(f"  {lv} ~~ 1*{lv}" for lv in constructs.keys())
+
+        cov_part = ("\n" + "\n".join(f"  {a} ~~ {b}" for a,b in cfa_cov_pairs)
+                    if cfa_cov_pairs else "")
+        deps = defaultdict(list)
+        for s, t in hypotheses:
+            deps[t].append(s)
+        struct_str = "\n".join(f"  {t} ~ {' + '.join(ss)}" for t,ss in deps.items())
+
+        # 요인분산=1 시도, 실패 시 참조지표 방식
+        base_with_var = meas_str + "\n" + var_str + cov_part + "\n" + struct_str
+        base_no_var   = meas_str + cov_part + "\n" + struct_str
+        base_str = base_with_var if _fit_model(base_with_var) is not None else base_no_var
 
         # ── 초기 SEM ──────────────────────────────────────────────────────────
         m0 = _fit_model(base_str)
         if m0 is None:
             st.error("SEM 초기 추정 실패")
             return None, None, None, None, [], False
-        fit0   = _extract_fit(m0)
-        path0  = _extract_paths(m0)
+        fit0  = _extract_fit(m0)
+        path0 = _extract_paths(m0)
 
-        # ── MI 기반 반복 수정 ─────────────────────────────────────────────────
-        extra_cov   = []
-        added_pairs = set()
+        # ── MI 기반 반복 수정 (R auto_refit_sem_criteria와 동일) ──────────────
+        extra_cov   = list(cfa_cov_pairs)  # CFA 확정 공분산에서 시작
+        added_pairs = {tuple(sorted(p)) for p in cfa_cov_pairs}
         mod_log     = []
-        m_cur       = m0
-        fit_cur     = fit0.copy()
+        m_cur, fit_cur = m0, fit0.copy()
 
-        for _ in range(max_mods):
-            if _adequate(fit_cur):
-                break
+        for step in range(max_mods):
+            if _adequate_check(fit_cur):
+                break                           # ✅ 모든 기준 충족
+
             mi_cur = calc_mi_approx(m_cur, data, all_items)
-            high   = mi_cur[mi_cur["MI"] > mi_threshold]
-            if high.empty:
-                break
-            improved = False
-            for _, row in high.iterrows():
-                v1, v2 = row["변수1"], row["변수2"]
-                pair   = tuple(sorted([v1, v2]))
-                if pair in added_pairs:
-                    continue
-                if item_to_lv.get(v1) != item_to_lv.get(v2):
-                    continue
-                new_cov = extra_cov + [(v1, v2)]
-                new_str = (base_str + "\n" +
-                           "\n".join(f"  {a} ~~ {b}" for a, b in new_cov))
-                m_new   = _fit_model(new_str)
-                if m_new is None:
-                    continue
-                fit_new = _extract_fit(m_new)
-                mod_log.append({
-                    "수정 경로":   f"{v1} ~~ {v2}",
-                    "소속 요인":   item_to_lv.get(v1,"-"),
-                    "MI":          row["MI"],
-                    "CFI 전→후":   f"{fit_cur.get('CFI','-')} → {fit_new.get('CFI','-')}",
-                    "RMSEA 전→후": f"{fit_cur.get('RMSEA','-')} → {fit_new.get('RMSEA','-')}",
-                })
-                extra_cov   = new_cov
-                m_cur       = m_new
-                fit_cur     = fit_new
-                added_pairs.add(pair)
-                improved    = True
-                break
-            if not improved:
+            avail  = mi_cur[
+                (mi_cur["MI"] > mi_threshold) &
+                (~mi_cur.apply(
+                    lambda r: tuple(sorted([r["변수1"], r["변수2"]])) in added_pairs,
+                    axis=1))
+            ]
+            if avail.empty:
                 break
 
-        # 수정 후 경로 재추출
-        path_final = _extract_paths(m_cur) if extra_cov else path0
-        was_mod    = len(extra_cov) > 0
+            row    = avail.iloc[0]
+            v1, v2 = row["변수1"], row["변수2"]
+            pair   = tuple(sorted([v1, v2]))
+
+            new_cov = extra_cov + [(v1, v2)]
+            new_cov_str = "\n".join(f"  {a} ~~ {b}" for a,b in new_cov)
+            new_str = (meas_str + "\n" + var_str + "\n" + new_cov_str
+                       + "\n" + struct_str
+                       if "\n" + var_str in base_str
+                       else meas_str + "\n" + new_cov_str + "\n" + struct_str)
+            m_new = _fit_model(new_str)
+            if m_new is None:
+                added_pairs.add(pair); continue
+            fit_new = _extract_fit(m_new)
+
+            lv1 = item_to_lv.get(v1, v1); lv2 = item_to_lv.get(v2, v2)
+            mod_log.append({
+                "단계":        step+1,
+                "수정 경로":   f"{v1} ~~ {v2}",
+                "소속 요인":   lv1 if lv1==lv2 else f"{lv1}↔{lv2}",
+                "MI":          round(row["MI"],3),
+                "CFI 전→후":   f"{fit_cur.get('CFI','-')}→{fit_new.get('CFI','-')}",
+                "RMSEA 전→후": f"{fit_cur.get('RMSEA','-')}→{fit_new.get('RMSEA','-')}",
+            })
+            extra_cov = new_cov; m_cur = m_new; fit_cur = fit_new
+            added_pairs.add(pair)
+
+        path_final = _extract_paths(m_cur)
+        was_mod    = len(mod_log) > 0
 
         return (path_final, fit0, fit_cur,
                 pd.DataFrame(mod_log), extra_cov, was_mod)
