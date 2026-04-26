@@ -125,8 +125,11 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=50):
         item_to_lv = {item: lv for lv, items in constructs.items() for item in items}
         all_items  = [i for items in constructs.values() for i in items]
         data       = df[all_items].dropna()
-        base_str   = "\n".join(f"  {lv} =~ {' + '.join(items)}"
-                               for lv, items in constructs.items())
+        # 요인분산=1 고정 방식 → 모든 문항의 SE·t값·p값 산출 가능
+        meas_lines = [f"  {lv} =~ {' + '.join(items)}"
+                      for lv, items in constructs.items()]
+        var_lines  = [f"  {lv} ~~ 1*{lv}" for lv in constructs.keys()]
+        base_str   = "\n".join(meas_lines) + "\n" + "\n".join(var_lines)
 
         def _fit(model_str):
             try:
@@ -211,6 +214,7 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=50):
                     continue                    # 같은 요인 내만 허용
 
                 new_cov = extra_cov + [(v1, v2)]
+                # base_str 이미 var_lines 포함 → 잔차공분산만 추가
                 new_str = (base_str + "\n" +
                            "\n".join(f"  {a} ~~ {b}" for a, b in new_cov))
                 m_new   = _fit(new_str)
@@ -441,9 +445,11 @@ def build_sem_table(df, constructs, hypotheses,
         lv_names   = set(constructs.keys())
         data       = df[all_items].dropna()
 
-        # ── 측정모형 (CFA 확정 공분산 포함) + 구조경로 ───────────────────────
-        meas_str = "\n".join(f"  {lv} =~ {' + '.join(items)}"
-                             for lv, items in constructs.items())
+        # ── 측정모형 (요인분산=1 고정) + CFA 확정 공분산 + 구조경로 ─────────
+        meas_lines = [f"  {lv} =~ {' + '.join(items)}"
+                      for lv, items in constructs.items()]
+        var_lines  = [f"  {lv} ~~ 1*{lv}" for lv in constructs.keys()]
+        meas_str   = "\n".join(meas_lines) + "\n" + "\n".join(var_lines)
         # CFA에서 확정된 잔차공분산 이어받기 (Anderson & Gerbing 2단계)
         cfa_cov  = cfa_extra_cov or []
         cov_str  = ("\n" + "\n".join(f"  {a} ~~ {b}" for a, b in cfa_cov)
