@@ -748,7 +748,7 @@ def suggest_analyses(df, constructs):
 # ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
-st.markdown('<p class="main-title">📊 통계 자동 분석기</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-title">📊 최영진의 통계 자동 분석기</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-title">데이터를 업로드하면 적합한 통계방법을 자동으로 제안합니다.</p>',
             unsafe_allow_html=True)
 
