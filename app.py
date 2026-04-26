@@ -131,7 +131,6 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=200):
         meas_lines = [f"  {lv} =~ {' + '.join(items)}"
                       for lv, items in constructs.items()]
         meas_str   = "\n".join(meas_lines)
-        var_str    = "\n".join(f"  {lv} ~~ 1*{lv}" for lv in constructs.keys())
 
         def _fit(model_str):
             try:
@@ -139,10 +138,18 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=200):
             except Exception:
                 return None
 
-        # 요인분산=1 고정 시도 → 모든 문항 SE·t·p 산출 가능
-        base_str = meas_str + "\n" + var_str
-        if _fit(base_str) is None:
-            base_str = meas_str      # 폴백: 참조지표 방식
+        # 요인분산=1 고정 → 참조지표 없이 모든 문항 SE·t·p 산출
+        # semopy 버전별로 문법이 다를 수 있으므로 순서대로 시도
+        base_str = meas_str   # 기본값(참조지표 방식)
+        for _var_syntax in [
+            "\n".join(f"  {lv} ~~ 1*{lv}"   for lv in constructs.keys()),
+            "\n".join(f"  {lv} ~~ 1 * {lv}" for lv in constructs.keys()),
+            "\n".join(f"  {lv} ~~ 1@{lv}"   for lv in constructs.keys()),
+        ]:
+            _candidate = meas_str + "\n" + _var_syntax
+            if _fit(_candidate) is not None:
+                base_str = _candidate
+                break
 
         def _extract_fit(m):
             try:
@@ -187,11 +194,18 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=200):
                 break                           # ✅ 모든 기준 충족
 
             # 미추가 쌍 중 MI 최대값 선택 (요인 구분 없음 — R과 동일)
-            avail = mi_cur[
-                (mi_cur["MI"] > mi_threshold) &
-                (~mi_cur.apply(
-                    lambda r: tuple(sorted([r["변수1"], r["변수2"]])) in added_pairs,
-                    axis=1))
+            # pandas apply 버그 회피: list comprehension 으로 필터
+            high_mi = mi_cur[mi_cur["MI"] > mi_threshold]
+            if high_mi.empty:
+                break
+
+            already = {tuple(sorted([r["변수1"], r["변수2"]]))
+                       for _, r in high_mi.iterrows()
+                       if tuple(sorted([r["변수1"], r["변수2"]])) in added_pairs}
+            avail = high_mi[
+                high_mi.apply(
+                    lambda r: tuple(sorted([r["변수1"], r["변수2"]])) not in added_pairs,
+                    axis=1)
             ]
             if avail.empty:
                 break                           # 더 이상 추가할 MI 없음
@@ -228,17 +242,19 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=200):
 
         ins     = m_cur.inspect(std_est=True)
         std_col = next((c for c in ins.columns if "std" in c.lower()), ins.columns[-1])
+        final_mi = calc_mi_approx(m_cur, data, all_items)  # 수정 후 최종 MI
 
         return {
             "init_model":   m0,   "mod_model":    m_cur,
             "init_fit":     fit0, "mod_fit":      fit_cur,
             "init_mi":      mi_df0,
+            "final_mi":     final_mi,           # 수정 후 최종 MI 테이블
             "mod_log":      pd.DataFrame(mod_log),
             "extra_cov":    extra_cov,
             "was_modified": len(extra_cov) > 0,
             "ins": ins, "std_col": std_col,
             "data": data, "all_items": all_items,
-            "base_str": base_str,              # SEM에 전달
+            "base_str": base_str,
         }, None
 
     except Exception as e:
@@ -374,15 +390,15 @@ def _extract_load_df(ins, std_col, constructs):
     return load_df.reset_index(drop=True), lv_col
 
 
-def build_cfa_tables(df, constructs, mi_threshold=3.84, max_mods=50):
+def build_cfa_tables(df, constructs, mi_threshold=3.84, max_mods=200):
     """
     CFA 실행 → MI 계산 → 수정모형 반환
-    Returns (load_df, rel_df, init_fit, mod_fit, mi_df, mod_log, was_modified, extra_cov)
+    Returns (load_df, rel_df, init_fit, mod_fit, init_mi, final_mi, mod_log, was_modified, extra_cov)
     """
     result, err = run_cfa_with_mi(df, constructs, mi_threshold, max_mods)
     if result is None:
         st.error(err or "CFA 실행 실패")
-        return None, None, None, None, None, None, False, []
+        return None, None, None, None, None, None, None, False, []
 
     try:
         ins      = result["ins"]
@@ -400,12 +416,13 @@ def build_cfa_tables(df, constructs, mi_threshold=3.84, max_mods=50):
 
         return (load_df, pd.DataFrame(rel_rows),
                 result["init_fit"], result["mod_fit"],
-                result["init_mi"],  result["mod_log"],
+                result["init_mi"],  result.get("final_mi", pd.DataFrame()),
+                result["mod_log"],
                 result["was_modified"], result["extra_cov"])
 
     except Exception as e:
         st.error(f"CFA 결과 처리 오류: {e}")
-        return None, None, None, None, None, None, False, []
+        return None, None, None, None, None, None, None, False, []
 
 
 def build_sem_table(df, constructs, hypotheses,
@@ -1007,22 +1024,25 @@ with st.spinner("분석 중입니다..."):
     if selected.get("확인적 요인분석 (CFA)") and constructs:
         with st.spinner("CFA 분석 중 (MI 기반 모형수정 포함)..."):
             try:
-                loads, rel_df, fit_init, fit_mod, mi_df, mod_log, was_mod, extra_cov = \
+                loads, rel_df, fit_init, fit_mod, init_mi, final_mi, mod_log, was_mod, extra_cov = \
                     build_cfa_tables(df, constructs)
                 if loads is not None:
                     cfa_extra_cov = extra_cov   # SEM 2단계에 전달
                     tab_data["CFA"] = (loads, rel_df, fit_init, fit_mod,
-                                       mi_df, mod_log, was_mod, extra_cov)
+                                       init_mi, final_mi, mod_log, was_mod, extra_cov)
                     tab_labels.append("CFA")
                     xlsx_sheets["표2_CFA"]     = ("CFA — 요인부하량", loads,
-                                                    "※ 표준화β≥.50, AVE≥.50, CR≥.70")
+                                                    "※ 표준화계수≥.50, AVE≥.50, CR≥.70")
                     xlsx_sheets["표2_신뢰도"] = ("CFA — AVE/CR/α",  rel_df, "")
                     if was_mod and not mod_log.empty:
                         xlsx_sheets["CFA_수정과정"] = ("CFA — MI 기반 수정 과정",
-                                                        mod_log, "※ MI>10: 수정 권고")
-                    if not mi_df.empty:
-                        xlsx_sheets["CFA_MI"] = ("CFA — 수정지수(MI)",
-                                                  mi_df.head(20), "※ MI>10: 공분산 추가 고려")
+                                                        mod_log, "※ MI>3.84 기준")
+                    if not init_mi.empty:
+                        xlsx_sheets["CFA_MI초기"] = ("CFA — 초기 수정지수(MI)",
+                                                      init_mi.head(20), "")
+                    if not final_mi.empty:
+                        xlsx_sheets["CFA_MI최종"] = ("CFA — 최종 수정지수(MI)",
+                                                      final_mi.head(20), "")
                 else:
                     st.warning("⚠️ CFA 결과 생성 실패. semopy 설치 및 구성개념 설정을 확인하세요.")
             except Exception as e:
@@ -1206,7 +1226,8 @@ for tab, lbl in zip(tabs, tab_labels):
             st.caption("α ≥ .70: 내적 일관성 확보")
 
         elif lbl == "CFA":
-            loads, rel_df, fit_init, fit_mod, mi_df, mod_log, was_mod, extra_cov = c
+            loads, rel_df, fit_init, fit_mod, init_mi, final_mi, mod_log, was_mod, extra_cov = c
+            mi_df = init_mi   # 하위 호환 유지
 
             # ── 적합도 기준표 ────────────────────────────────────────────────
             crit_df = pd.DataFrame([
@@ -1281,16 +1302,26 @@ for tab, lbl in zip(tabs, tab_labels):
                 if all_ok:
                     st.success("✅ 초기 모형 적합도 양호 — 수정 불필요")
                 else:
-                    st.info("ℹ️ 적합도 기준 미충족이나 같은 요인 내 MI > 3.84 쌍이 없어 수정 불가")
+                    st.info("ℹ️ 적합도 기준 미충족이나 MI > 3.84 쌍이 없어 더 이상 수정 불가 — 최종 MI 표를 확인하세요")
 
-            # ── MI 표 ─────────────────────────────────────────────────────────
-            if mi_df is not None and not mi_df.empty:
-                with st.expander("🔍 수정지수(MI) 상위 20개"):
-                    disp_mi = mi_df.head(20).copy()
-                    disp_mi["판정"] = disp_mi["MI"].apply(
-                        lambda v: "⚠️ 수정 고려" if v > 3.84 else "")
-                    st.dataframe(disp_mi, use_container_width=True)
-                    st.caption("MI > 3.84 (p < .05): 잔차공분산 추가 고려. 이론적 근거 필수.")
+            # ── MI 표 (초기 / 최종) ───────────────────────────────────────────
+            col_mi1, col_mi2 = st.columns(2)
+            with col_mi1:
+                if init_mi is not None and not init_mi.empty:
+                    with st.expander("🔍 초기 수정지수(MI) 상위 20개"):
+                        d = init_mi.head(20).copy()
+                        d["판정"] = d["MI"].apply(lambda v: "⚠️ 수정 고려" if v > 3.84 else "")
+                        st.dataframe(d, use_container_width=True)
+            with col_mi2:
+                if final_mi is not None and not final_mi.empty:
+                    with st.expander("🔍 최종 수정지수(MI) 상위 20개"):
+                        d = final_mi.head(20).copy()
+                        d["판정"] = d["MI"].apply(lambda v: "⚠️ 추가 수정 가능" if v > 3.84 else "✅")
+                        st.dataframe(d, use_container_width=True)
+                        if (final_mi["MI"] > 3.84).any():
+                            st.warning("최종 모형에도 MI > 3.84 쌍이 남아 있습니다. 이론적 검토 후 추가 수정을 고려하세요.")
+                        else:
+                            st.success("모든 잔여 MI < 3.84 — 더 이상 수정 불필요")
 
             st.markdown("---")
             st.markdown("**CFA 결과** (수정모형 기준)")
