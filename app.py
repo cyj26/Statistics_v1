@@ -346,36 +346,44 @@ def run_cfa_sem(df, constructs, hypotheses=None):
 
 
 def _extract_load_df(ins, std_col, constructs):
-    """inspect() 결과에서 요인부하량 + AVE/CR 추출 (semopy 1.x/2.x 공용)"""
+    """inspect() 결과에서 요인부하량 추출 (semopy 1.x/2.x 공용)
+    반환 컬럼: 잠재변수, 측정변수, 표준화계수, SE, t값, p값
+    """
     lv_names  = set(constructs.keys())
     all_items = set(i for v in constructs.values() for i in v)
 
     if (ins["op"] == "=~").any():          # semopy 1.x
-        load_df           = ins[ins["op"] == "=~"].copy()
-        lv_col, ind_col   = "lval", "rval"
-        rename_lv, rename_ind = "잠재변수", "측정변수"
+        load_df         = ins[ins["op"] == "=~"].copy()
+        lv_col, ind_col = "lval", "rval"
     else:                                   # semopy 2.x
-        load_df           = ins[ins["lval"].isin(all_items) &
-                                ins["rval"].isin(lv_names)].copy()
-        lv_col, ind_col   = "rval", "lval"
-        rename_lv, rename_ind = "잠재변수", "측정변수"
+        load_df         = ins[ins["lval"].isin(all_items) &
+                               ins["rval"].isin(lv_names)].copy()
+        lv_col, ind_col = "rval", "lval"
 
-    cols_needed = [ind_col, lv_col, "Estimate", std_col, "Std. Err", "z-value", "p-value"]
+    # 잠재변수 → 측정변수 순서, 비표준화β(Estimate) 제외
+    cols_needed = [lv_col, ind_col, std_col, "Std. Err", "z-value", "p-value"]
     cols_needed = [c for c in cols_needed if c in load_df.columns]
     load_df     = load_df[cols_needed].copy()
 
-    rename_map  = {lv_col: rename_lv, ind_col: rename_ind,
-                   "Estimate": "비표준화β", std_col: "표준화β",
-                   "Std. Err": "SE", "z-value": "C.R.", "p-value": "p값_raw"}
-    load_df     = load_df.rename(columns=rename_map)
+    rename_map = {lv_col: "잠재변수", ind_col: "측정변수",
+                  std_col: "표준화계수",
+                  "Std. Err": "SE", "z-value": "t값", "p-value": "p값_raw"}
+    load_df = load_df.rename(columns=rename_map)
 
+    # p값 포맷
     if "p값_raw" in load_df.columns:
         load_df["p값"] = load_df["p값_raw"].apply(
             lambda p: fmt_p(p) if str(p).strip() not in ("-", "") else "-")
-        load_df         = load_df.drop(columns=["p값_raw"])
+        load_df = load_df.drop(columns=["p값_raw"])
 
-    for col in [c for c in ["비표준화β","표준화β","SE","C.R."] if c in load_df.columns]:
-        load_df[col] = pd.to_numeric(load_df[col], errors="coerce").round(3)
+    # 숫자형 변환 (참조지표는 SE·t값이 None/NaN → "-"로 표시)
+    load_df["표준화계수"] = pd.to_numeric(load_df["표준화계수"], errors="coerce").round(3)
+    for col in ["SE", "t값"]:
+        if col in load_df.columns:
+            load_df[col] = load_df[col].apply(
+                lambda v: round(float(v), 3)
+                if pd.notna(v) and str(v).strip() not in ("None", "", "nan", "-")
+                else "-")
 
     return load_df.reset_index(drop=True), lv_col
 
@@ -1295,13 +1303,12 @@ for tab, lbl in zip(tabs, tab_labels):
 
             # ── 요인부하량 + AVE/CR/α 통합 테이블 ─────────────────────────────
             try:
-                merged = loads.copy()
-                # AVE/CR/α 컬럼 초기화
-                merged["AVE"]        = ""
-                merged["CR"]         = ""
-                merged["Cronbach_α"] = ""
+                merged  = loads.copy()
+                merged["AVE"]       = ""
+                merged["CR"]        = ""
+                merged["Cronbach α"] = ""
                 rel_map = rel_df.set_index("잠재변수")
-                seen = set()
+                seen    = set()
                 for idx, row in merged.iterrows():
                     lv = row["잠재변수"]
                     if lv not in seen:
@@ -1309,17 +1316,13 @@ for tab, lbl in zip(tabs, tab_labels):
                         if lv in rel_map.index:
                             merged.at[idx, "AVE"]        = rel_map.loc[lv, "AVE"]
                             merged.at[idx, "CR"]         = rel_map.loc[lv, "CR"]
-                            merged.at[idx, "Cronbach_α"] = rel_map.loc[lv, "Cronbach α"]
+                            merged.at[idx, "Cronbach α"] = rel_map.loc[lv, "Cronbach α"]
 
-                # 컬럼 선택 및 이름 정리 (비표준화β 제외)
-                col_rename = {"표준화β": "표준화계수", "C.R.": "t값", "Cronbach_α": "Cronbach α"}
-                disp_cols  = ["잠재변수", "측정변수", "표준화계수", "SE", "t값",
-                              "p값", "AVE", "CR", "Cronbach α"]
-                merged = merged.rename(columns=col_rename)
+                disp_cols = ["잠재변수", "측정변수", "표준화계수", "SE", "t값",
+                             "p값", "AVE", "CR", "Cronbach α"]
                 merged = merged[[c for c in disp_cols if c in merged.columns]]
                 st.dataframe(merged, use_container_width=True, hide_index=True)
-            except Exception:
-                # 통합 실패 시 기존 방식 폴백
+            except Exception as _e:
                 st.dataframe(loads, use_container_width=True)
                 st.dataframe(rel_df, use_container_width=True)
 
