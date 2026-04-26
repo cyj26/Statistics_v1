@@ -28,7 +28,7 @@ def _check_password():
     if st.session_state.get("_pw_ok"):
         return True
 
-    st.markdown("## 🔒 통계 자동 분석기")
+    st.markdown("## 🔒 최영진의 통계 자동 분석기")
     st.text_input("비밀번호를 입력하세요", type="password",
                   key="_pw_input", on_change=_submit)
     if "_pw_ok" in st.session_state and not st.session_state["_pw_ok"]:
