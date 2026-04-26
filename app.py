@@ -1,5 +1,5 @@
 # =============================================================================
-#  최영진의 통계 자동 분석기
+# 📊 통계 자동 분석기
 # 실행: python -m streamlit run app.py
 # =============================================================================
 import streamlit as st
@@ -8,7 +8,7 @@ import numpy as np
 import re
 from collections import defaultdict
 
-st.set_page_config(page_title="최영진의 통계 자동 분석기",
+st.set_page_config(page_title="📊 통계 자동 분석기",
                    page_icon="📊", layout="wide")
 
 # ── 비밀번호 잠금 ─────────────────────────────────────────────────────────────
@@ -28,7 +28,7 @@ def _check_password():
     if st.session_state.get("_pw_ok"):
         return True
 
-    st.markdown("## 🔒 최영진의 통계 자동 분석기")
+    st.markdown("## 🔒 통계 자동 분석기")
     st.text_input("비밀번호를 입력하세요", type="password",
                   key="_pw_input", on_change=_submit)
     if "_pw_ok" in st.session_state and not st.session_state["_pw_ok"]:
@@ -748,7 +748,7 @@ def suggest_analyses(df, constructs):
 # ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
-st.markdown('<p class="main-title">📊 최영진의 통계 자동 분석기</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-title">📊 통계 자동 분석기</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-title">데이터를 업로드하면 적합한 통계방법을 자동으로 제안합니다.</p>',
             unsafe_allow_html=True)
 
@@ -1291,11 +1291,39 @@ for tab, lbl in zip(tabs, tab_labels):
                     st.caption("MI > 3.84 (p < .05): 잔차공분산 추가 고려. 이론적 근거 필수.")
 
             st.markdown("---")
-            st.markdown("**요인부하량** (수정모형 기준)")
-            st.dataframe(loads, use_container_width=True)
-            st.markdown("**AVE / CR / Cronbach α**")
-            st.dataframe(rel_df, use_container_width=True)
-            st.caption("권장: 표준화β ≥ .50 | AVE ≥ .50 | CR ≥ .70 | α ≥ .70")
+            st.markdown("**CFA 결과** (수정모형 기준)")
+
+            # ── 요인부하량 + AVE/CR/α 통합 테이블 ─────────────────────────────
+            try:
+                merged = loads.copy()
+                # AVE/CR/α 컬럼 초기화
+                merged["AVE"]        = ""
+                merged["CR"]         = ""
+                merged["Cronbach_α"] = ""
+                rel_map = rel_df.set_index("잠재변수")
+                seen = set()
+                for idx, row in merged.iterrows():
+                    lv = row["잠재변수"]
+                    if lv not in seen:
+                        seen.add(lv)
+                        if lv in rel_map.index:
+                            merged.at[idx, "AVE"]        = rel_map.loc[lv, "AVE"]
+                            merged.at[idx, "CR"]         = rel_map.loc[lv, "CR"]
+                            merged.at[idx, "Cronbach_α"] = rel_map.loc[lv, "Cronbach α"]
+
+                # 컬럼 선택 및 이름 정리 (비표준화β 제외)
+                col_rename = {"표준화β": "표준화계수", "C.R.": "t값", "Cronbach_α": "Cronbach α"}
+                disp_cols  = ["잠재변수", "측정변수", "표준화계수", "SE", "t값",
+                              "p값", "AVE", "CR", "Cronbach α"]
+                merged = merged.rename(columns=col_rename)
+                merged = merged[[c for c in disp_cols if c in merged.columns]]
+                st.dataframe(merged, use_container_width=True, hide_index=True)
+            except Exception:
+                # 통합 실패 시 기존 방식 폴백
+                st.dataframe(loads, use_container_width=True)
+                st.dataframe(rel_df, use_container_width=True)
+
+            st.caption("권장: 표준화계수 ≥ .50 | AVE ≥ .50 | CR ≥ .70 | Cronbach α ≥ .70")
 
         elif lbl == "상관관계":
             st.dataframe(c, use_container_width=True)
