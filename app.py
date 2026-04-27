@@ -6,9 +6,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+from datetime import datetime
 from collections import defaultdict
 
-st.set_page_config(page_title="통계 자동 분석기",
+st.set_page_config(page_title="📊 통계 자동 분석기",
                    page_icon="📊", layout="wide")
 
 # ── 비밀번호 잠금 ─────────────────────────────────────────────────────────────
@@ -99,6 +100,43 @@ def detect_outliers_mahalanobis(df, cols, p_threshold=0.001):
 
     except Exception as e:
         return None, None, []
+
+
+def compute_smc(df, cols):
+    """
+    다중상관자승(SMC, Squared Multiple Correlations) 계산
+    각 변수를 나머지 모든 변수로 회귀분석한 R² 값
+    SMC < 0.2 이면 판별력 부족으로 제거 고려
+    Returns: DataFrame with 변수, SMC, 판정
+    """
+    data = df[cols].dropna()
+    if len(data) < len(cols) + 2:
+        return pd.DataFrame({"변수": cols, "SMC": [np.nan]*len(cols),
+                             "판정": ["사례 수 부족"]*len(cols)})
+    rows = []
+    for col in cols:
+        others = [c for c in cols if c != col]
+        if not others:
+            rows.append({"변수": col, "SMC": np.nan, "판정": "-"})
+            continue
+        try:
+            X = data[others].values.astype(float)
+            y = data[col].values.astype(float)
+            Xc = np.column_stack([np.ones(len(X)), X])
+            b, _, _, _ = np.linalg.lstsq(Xc, y, rcond=None)
+            yh = Xc @ b
+            ss_res = float(np.sum((y - yh) ** 2))
+            ss_tot = float(np.sum((y - y.mean()) ** 2))
+            r2 = (1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+            rows.append({
+                "변수": col,
+                "SMC": round(float(r2), 3),
+                "판정": "⚠️ 제거 고려 (SMC < .20)"
+                        if (not np.isnan(r2) and r2 < 0.2) else "✅ 정상"
+            })
+        except Exception:
+            rows.append({"변수": col, "SMC": np.nan, "판정": "계산 오류"})
+    return pd.DataFrame(rows)
 
 
 def auto_detect_constructs(df):
@@ -806,6 +844,109 @@ def suggest_analyses(df, constructs):
     }
 
 
+def build_single_sheet_excel(sheets: dict) -> bytes:
+    """
+    모든 분석 결과를 하나의 시트에 세로로 통합
+    섹션별 제목 → 헤더 → 데이터 → 주석 → 2행 공백 반복
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        import io as _io
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "분석결과"
+
+        _hdr_font  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        _hdr_fill  = PatternFill("solid", fgColor="2F5496")
+        _ttl_font  = Font(name="Arial", bold=True, size=12, color="2F5496")
+        _note_font = Font(name="Arial", size=9, color="595959", italic=True)
+        _ctr = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        _lft = Alignment(horizontal="left",   vertical="center")
+        _bd  = Border(left=Side(style="thin"), right=Side(style="thin"),
+                      top=Side(style="thin"),  bottom=Side(style="thin"))
+        _adopt_fill_y = PatternFill("solid", fgColor="E2EFDA")
+        _adopt_fill_n = PatternFill("solid", fgColor="FFC7CE")
+        _adopt_font_y = Font(name="Arial", size=10, color="375623")
+        _adopt_font_n = Font(name="Arial", size=10, color="9C0006")
+
+        cur_row = 1
+
+        for name, payload in sheets.items():
+            try:
+                title     = payload[0]
+                df_data   = payload[1]
+                note      = payload[2] if len(payload) > 2 else ""
+                adopt_col = payload[3] if len(payload) > 3 else None
+
+                if df_data is None or len(df_data) == 0:
+                    continue
+
+                cols = list(df_data.columns)
+                nc   = max(len(cols), 1)
+                adopt_idx = (cols.index(adopt_col) + 1
+                             if adopt_col and adopt_col in cols else None)
+
+                # 섹션 제목
+                ws.merge_cells(start_row=cur_row, start_column=1,
+                               end_row=cur_row, end_column=nc)
+                cell = ws.cell(row=cur_row, column=1, value=title)
+                cell.font = _ttl_font
+                cur_row += 1
+
+                # 헤더 행
+                for ci, col in enumerate(cols, 1):
+                    c = ws.cell(row=cur_row, column=ci, value=str(col))
+                    c.font = _hdr_font; c.fill = _hdr_fill
+                    c.alignment = _ctr; c.border = _bd
+                cur_row += 1
+
+                # 데이터 행
+                for row in df_data.itertuples(index=False):
+                    for ci, val in enumerate(row, 1):
+                        safe_val = ("" if isinstance(val, float)
+                                    and (val != val) else val)  # NaN → ""
+                        cell = ws.cell(row=cur_row, column=ci, value=safe_val)
+                        cell.alignment = _lft if ci <= 2 else _ctr
+                        cell.border = _bd
+                        if adopt_idx and ci == adopt_idx:
+                            is_y = str(val) == "채택"
+                            cell.fill = _adopt_fill_y if is_y else _adopt_fill_n
+                            cell.font = _adopt_font_y if is_y else _adopt_font_n
+                    cur_row += 1
+
+                # 주석 행
+                if note:
+                    nc_cell = ws.cell(row=cur_row, column=1, value=note)
+                    nc_cell.font = _note_font
+                    cur_row += 1
+
+                # 섹션 구분 (2행 공백)
+                cur_row += 2
+
+            except Exception:
+                pass
+
+        # 열 너비 자동 조정
+        for col_cells in ws.columns:
+            try:
+                w = max((len(str(c.value)) if c.value else 0) for c in col_cells)
+                ws.column_dimensions[col_cells[0].column_letter].width = min(w + 4, 45)
+            except Exception:
+                pass
+
+        buf = _io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    except Exception as e:
+        # 오류 시 빈 xlsx 반환
+        from openpyxl import Workbook
+        import io as _io
+        wb = Workbook(); buf = _io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
@@ -842,14 +983,17 @@ st.success(f"✅ 파일 로드 완료 — {len(df)}행 × {len(df.columns)}열")
 with st.expander("📋 데이터 미리보기 (상위 10행)"):
     st.dataframe(df.head(10), use_container_width=True)
 
-# ── STEP 1-5: 이상치 탐지 (Mahalanobis Distance) ──────────────────────────────
+# ── STEP 1-5: 이상치 탐지 (Mahalanobis + SMC) ────────────────────────────────
 st.markdown("---")
-st.markdown("### 🔎 STEP 1-5. 다변량 이상치 탐지 (Mahalanobis Distance)")
-st.caption("χ² 분포 기준으로 마할라노비스 거리가 임계값을 초과하는 표본을 이상치로 탐지합니다.")
+st.markdown("### 🔎 STEP 1-5. 이상치 탐지 (마할라노비스 거리 + 다중상관자승)")
 
 num_cols_all = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
-with st.expander("⚙️ 이상치 탐지 설정", expanded=True):
+tab_maha, tab_smc = st.tabs(["📍 마할라노비스 거리 (표본 이상치)", "📐 다중상관자승 / SMC (변수 이상치)"])
+
+# ────────────────────── 탭 1: 마할라노비스 거리 ──────────────────────────────
+with tab_maha:
+    st.caption("χ² 분포 기준으로 마할라노비스 거리가 임계값을 초과하는 **표본(행)**을 이상치로 탐지합니다.")
     col_a, col_b = st.columns([3, 1])
     outlier_cols = col_a.multiselect(
         "분석에 사용할 변수 선택 (기본: 전체 수치형)",
@@ -858,58 +1002,113 @@ with st.expander("⚙️ 이상치 탐지 설정", expanded=True):
         "유의수준 (엄격할수록 이상치 적음)",
         [0.001, 0.005, 0.01, 0.05], index=0, key="oc_pthr")
 
-    if outlier_cols and st.button("🔍 이상치 탐지 실행", key="oc_run"):
+    if outlier_cols and st.button("🔍 마할라노비스 거리 탐지 실행", key="oc_run"):
         oc_result, oc_cutoff, oc_idx = detect_outliers_mahalanobis(
             df, outlier_cols, p_threshold=p_thr)
         st.session_state["oc_result"] = oc_result
         st.session_state["oc_cutoff"] = oc_cutoff
         st.session_state["oc_idx"]    = oc_idx
+        st.session_state.pop("oc_remove_rows", None)   # 선택 초기화
 
-if "oc_result" in st.session_state and st.session_state["oc_result"] is not None:
-    oc_result = st.session_state["oc_result"]
-    oc_cutoff = st.session_state["oc_cutoff"]
-    oc_idx    = st.session_state["oc_idx"]
-    n_out     = len(oc_idx)
+    if "oc_result" in st.session_state and st.session_state["oc_result"] is not None:
+        oc_result = st.session_state["oc_result"]
+        oc_cutoff = st.session_state["oc_cutoff"]
+        oc_idx    = st.session_state["oc_idx"]
+        n_out     = len(oc_idx)
 
-    st.markdown(f"**χ² 임계값 (df={len(outlier_cols)}, p<{p_thr}):** `{oc_cutoff}`")
+        st.markdown(f"**χ² 임계값:** `{oc_cutoff}`")
+        col_r1, col_r2, col_r3 = st.columns(3)
+        col_r1.metric("전체 표본", len(df))
+        col_r2.metric("탐지된 이상치", n_out,
+                      delta=f"-{n_out}" if n_out > 0 else "없음",
+                      delta_color="inverse")
+        col_r3.metric("제거 후 표본", len(df) - n_out)
 
-    col_r1, col_r2, col_r3 = st.columns(3)
-    col_r1.metric("전체 표본", len(df))
-    col_r2.metric("탐지된 이상치", n_out,
-                  delta=f"-{n_out}" if n_out > 0 else "없음",
-                  delta_color="inverse")
-    col_r3.metric("제거 후 표본", len(df) - n_out)
-
-    if n_out > 0:
-        st.markdown("**🔴 이상치로 탐지된 표본**")
-        outlier_rows = oc_result[oc_result["이상치"]].copy()
-        outlier_rows["판정"] = "⚠️ 이상치"
-
-        # 원본 데이터의 이상치 행 내용도 함께 표시
-        orig_outlier = df.iloc[oc_idx].copy().reset_index(drop=False)
-        orig_outlier = orig_outlier.rename(columns={"index": "원본 행번호(0-based)"})
-        orig_outlier.insert(0, "원본 행번호", oc_idx)
-        orig_outlier["마할라노비스 거리"] = outlier_rows["마할라노비스 거리"].values
-        orig_outlier["p값"]             = outlier_rows["p값"].values
-
-        with st.expander(f"📋 이상치 표본 상세 ({n_out}개)", expanded=True):
-            st.dataframe(orig_outlier, use_container_width=True)
-            st.caption(f"※ 마할라노비스 거리 > {oc_cutoff} (p < {p_thr}) 기준")
-
-        st.markdown("**전체 탐지 결과 (마할라노비스 거리 내림차순)**")
+        # 전체 탐지 결과 표
         disp_all = oc_result.sort_values("마할라노비스 거리", ascending=False).copy()
         disp_all["판정"] = disp_all["이상치"].map({True: "⚠️ 이상치", False: "✅ 정상"})
         disp_all = disp_all.drop(columns=["이상치"])
-        st.dataframe(disp_all, use_container_width=True, hide_index=True)
+        with st.expander("📋 마할라노비스 거리 전체 결과", expanded=(n_out > 0)):
+            st.dataframe(disp_all, use_container_width=True, hide_index=True)
 
-        remove_outliers = st.checkbox(
-            f"✅ 이상치 {n_out}개를 분석에서 제외하고 진행 (권장)",
-            value=True, key="oc_remove")
-        if remove_outliers:
-            df = df.drop(index=oc_idx).reset_index(drop=True)
-            st.success(f"✅ 이상치 {n_out}개 제거 완료 — 분석 표본: **{len(df)}개**")
-    else:
-        st.success("✅ 이상치가 탐지되지 않았습니다. 전체 표본으로 분석을 진행합니다.")
+        if n_out > 0:
+            outlier_row_nums = (oc_result[oc_result["이상치"] == True]["원본 행번호"]
+                                .tolist() if "이상치" in oc_result.columns
+                                else [])
+            # 세션에 없으면 전체 이상치를 기본값으로
+            _default_rows = [r for r in
+                             st.session_state.get("oc_remove_rows", outlier_row_nums)
+                             if r in outlier_row_nums]
+            st.markdown("**🗑️ 제거할 표본 선택** (기본: 탐지된 이상치 전체)")
+            st.multiselect(
+                f"이상치 표본 원본 행번호 (총 {n_out}개 탐지)",
+                options=outlier_row_nums,
+                default=_default_rows,
+                key="oc_remove_rows",
+                help="선택된 행만 분석에서 제거됩니다. 체크 해제 시 해당 표본은 유지됩니다.")
+        else:
+            st.success("✅ 이상치가 탐지되지 않았습니다.")
+
+# ────────────────────── 탭 2: 다중상관자승(SMC) ──────────────────────────────
+with tab_smc:
+    st.caption("각 변수를 나머지 변수로 회귀분석한 R²(SMC) < .20 이면 판별력 부족으로 **변수(열) 제거**를 고려합니다.")
+    smc_cols = st.multiselect(
+        "SMC 분석에 사용할 변수 선택 (기본: 전체 수치형)",
+        num_cols_all, default=num_cols_all, key="smc_cols")
+
+    if smc_cols and st.button("🔍 SMC 탐지 실행", key="smc_run"):
+        with st.spinner("SMC 계산 중..."):
+            smc_result = compute_smc(df, smc_cols)
+        st.session_state["smc_result"] = smc_result
+        st.session_state.pop("smc_drop_vars", None)   # 선택 초기화
+
+    if "smc_result" in st.session_state and st.session_state["smc_result"] is not None:
+        smc_result = st.session_state["smc_result"]
+        low_smc    = smc_result[smc_result["SMC"].notna() & (smc_result["SMC"] < 0.2)]
+        n_low      = len(low_smc)
+
+        col_s1, col_s2 = st.columns(2)
+        col_s1.metric("분석 변수 수", len(smc_result))
+        col_s2.metric("SMC < .20 변수", n_low,
+                      delta=f"제거 고려 {n_low}개" if n_low > 0 else "없음",
+                      delta_color="inverse" if n_low > 0 else "off")
+
+        with st.expander("📋 SMC 분석 결과 전체 (낮은 순)", expanded=(n_low > 0)):
+            st.dataframe(smc_result.sort_values("SMC").reset_index(drop=True),
+                         use_container_width=True, hide_index=True)
+            st.caption("SMC ≥ .20 권장 (각 변수가 다른 변수들에 의해 설명되는 비율)")
+
+        if n_low > 0:
+            low_vars = low_smc["변수"].tolist()
+            _default_vars = [v for v in
+                             st.session_state.get("smc_drop_vars", low_vars)
+                             if v in smc_result["변수"].tolist()]
+            st.markdown("**🗑️ 제거할 변수 선택** (기본: SMC < .20 변수 전체)")
+            st.multiselect(
+                f"SMC < .20 변수 (총 {n_low}개 탐지)",
+                options=smc_result["변수"].tolist(),
+                default=_default_vars,
+                key="smc_drop_vars",
+                help="선택된 변수는 분석에서 제외됩니다.")
+        else:
+            st.success("✅ SMC < .20 변수가 없습니다. 모든 변수가 판별력 기준을 충족합니다.")
+
+# ── 이상치/변수 제거 적용 (이후 모든 분석에 반영) ────────────────────────────
+_removed_rows = st.session_state.get("oc_remove_rows", [])
+_dropped_vars = st.session_state.get("smc_drop_vars", [])
+
+if _removed_rows:
+    _remove_idx = [int(r) - 1 for r in _removed_rows]  # 1-based → 0-based
+    _valid_idx  = [i for i in _remove_idx if i in df.index]
+    if _valid_idx:
+        df = df.drop(index=_valid_idx).reset_index(drop=True)
+        st.info(f"🗑️ 마할라노비스 이상치 **{len(_valid_idx)}개 표본** 제거 → 분석 표본: **{len(df)}개**")
+
+if _dropped_vars:
+    _actual_drop = [v for v in _dropped_vars if v in df.columns]
+    if _actual_drop:
+        df = df.drop(columns=_actual_drop)
+        st.info(f"🗑️ SMC < .20 변수 **{len(_actual_drop)}개** 제거: `{', '.join(_actual_drop)}`")
 
 # ── STEP 2: 구성개념 탐지 ─────────────────────────────────────────────────────
 st.markdown("---")
@@ -1606,18 +1805,21 @@ for tab, lbl in zip(tabs, tab_labels):
                 st.markdown("**부정 상위 텍스트**")
                 st.dataframe(c["부정상위"], use_container_width=True)
 
-# ── Excel 다운로드 ─────────────────────────────────────────────────────────────
+# ── Excel 다운로드 (모든 결과 한 시트에 통합) ─────────────────────────────────
 st.markdown("---")
 if xlsx_sheets:
     try:
-        xlsx_bytes = build_excel(xlsx_sheets)
+        _ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _fname     = f"RESULT_{_ts}.xlsx"
+        xlsx_bytes = build_single_sheet_excel(xlsx_sheets)
         st.download_button(
-            label="📥 RESULT.xlsx 다운로드",
+            label=f"📥 {_fname} 다운로드 (모든 결과 한 시트)",
             data=xlsx_bytes,
-            file_name="RESULT.xlsx",
+            file_name=_fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
             type="primary"
         )
+        st.caption("※ 모든 분석 결과가 '분석결과' 시트 하나에 섹션별로 통합되어 저장됩니다.")
     except Exception as e:
         st.error(f"Excel 생성 오류: {e}")
