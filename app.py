@@ -209,6 +209,14 @@ def run_cfa_with_mi(df, constructs, mi_threshold=3.84, max_mods=200):
                       for lv, items in constructs.items()]
         meas_str   = "\n".join(meas_lines)
 
+        # ── AMOS 기본값과 동일: 모든 잠재변수 간 공분산 명시적으로 자유추정 ──
+        lv_keys = list(constructs.keys())
+        lv_cov_lines = [f"  {lv_keys[i]} ~~ {lv_keys[j]}"
+                        for i in range(len(lv_keys))
+                        for j in range(i + 1, len(lv_keys))]
+        lv_cov_str = "\n".join(lv_cov_lines)
+        meas_str   = meas_str + ("\n" + lv_cov_str if lv_cov_str else "")
+
         def _fit(model_str):
             try:
                 m = Model(model_str); m.fit(data); return m
@@ -594,6 +602,15 @@ def build_sem_table(df, constructs, hypotheses,
         meas_lines = [f"  {lv} =~ {' + '.join(items)}"
                       for lv, items in constructs.items()]
         meas_str   = "\n".join(meas_lines)
+
+        # ── AMOS 기본값과 동일: 모든 잠재변수 간 공분산 명시적으로 자유추정 ──
+        lv_keys = list(constructs.keys())
+        lv_cov_lines = [f"  {lv_keys[i]} ~~ {lv_keys[j]}"
+                        for i in range(len(lv_keys))
+                        for j in range(i + 1, len(lv_keys))]
+        lv_cov_str = "\n".join(lv_cov_lines)
+        meas_str   = meas_str + ("\n" + lv_cov_str if lv_cov_str else "")
+
         var_str    = "\n".join(f"  {lv} ~~ 1*{lv}" for lv in constructs.keys())
 
         cov_part = ("\n" + "\n".join(f"  {a} ~~ {b}" for a,b in cfa_cov_pairs)
